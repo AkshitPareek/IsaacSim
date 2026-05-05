@@ -145,7 +145,7 @@ class FrankaPickPlace:
             prim_path="/World/OpenVLACamera",
             position=np.array([0.25, 0.0, 1.35]),
             frequency=10,
-            resolution=(320, 320),
+            resolution=(224, 224),
             orientation=rot_utils.euler_angles_to_quats(np.array([0, 90, 0]), degrees=True),
         )
         try:
@@ -162,6 +162,14 @@ class FrankaPickPlace:
     def _get_scripted_place_goal(self) -> np.ndarray:
         """Return the safe scripted Phase 4 carry/place target."""
         return self.target_position
+
+    def _log_vla_guided_goal(self, phase: int, source: str, goal_position: np.ndarray) -> None:
+        """Log concise VLA phase debug details at the existing VLA cadence."""
+        if self._step != 0 and self._step % self._vla_query_interval != 0:
+            return
+
+        formatted_goal = np.round(np.asarray(goal_position).reshape(-1), 4)
+        print(f"Phase {phase}: using {source}; end-effector goal target: {formatted_goal}")
 
     def _get_vla_rgb_image(self) -> Optional[np.ndarray]:
         """Read the current RGB camera image for the VLA server."""
@@ -290,6 +298,10 @@ class FrankaPickPlace:
             goal_position = self._get_vla_reach_goal()
             if goal_position is None:
                 goal_position = self._get_scripted_reach_goal()
+                goal_source = "scripted fallback"
+            else:
+                goal_source = "VLA"
+            self._log_vla_guided_goal(0, goal_source, goal_position)
 
             # Use the new high-level method that combines position and orientation
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -354,6 +366,10 @@ class FrankaPickPlace:
             goal_position = self._get_vla_place_goal()
             if goal_position is None:
                 goal_position = self._get_scripted_place_goal()
+                goal_source = "scripted fallback"
+            else:
+                goal_source = "VLA"
+            self._log_vla_guided_goal(4, goal_source, goal_position)
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
