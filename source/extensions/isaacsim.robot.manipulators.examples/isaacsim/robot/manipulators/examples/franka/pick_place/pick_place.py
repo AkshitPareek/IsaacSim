@@ -35,6 +35,7 @@ OPENVLA_SERVER_URL = os.getenv("OPENVLA_SERVER_URL", "http://localhost:8000/act"
 OPENVLA_INSTRUCTION = os.getenv("OPENVLA_INSTRUCTION", "pick up the blue cube and place it on the target")
 OPENVLA_LOG_ENABLED = os.getenv("OPENVLA_LOG_ENABLED", "1") != "0"
 OPENVLA_LOG_PATH = os.getenv("OPENVLA_LOG_PATH", "openvla_pick_place_log.csv")
+OPENVLA_GRASP_ASSIST_ENABLED = os.getenv("OPENVLA_GRASP_ASSIST_ENABLED", "1") != "0"
 
 
 class FrankaPickPlace:
@@ -62,6 +63,7 @@ class FrankaPickPlace:
         self._vla_enabled = os.getenv("OPENVLA_ENABLED", "1") != "0"
         self._run_id = str(int(time.time() * 1000))
         self._log_header_written = False
+        self._grasp_assist_offset = None
 
         # Define step counts for each phase
         self.events_dt = events_dt
@@ -353,6 +355,35 @@ class FrankaPickPlace:
         goal_position[2] = safe_carry_height
         return goal_position
 
+    def _capture_grasp_assist_offset(self) -> None:
+        """Measure the cube offset from the hand for prototype grasp stabilization."""
+        if not OPENVLA_GRASP_ASSIST_ENABLED or self._grasp_assist_offset is not None:
+            return
+
+        _, end_effector_position, _ = self.robot.get_current_state()
+        cube_position = self.cube.get_world_poses()[0].numpy()
+        self._grasp_assist_offset = cube_position[0] - end_effector_position[0]
+        print(f"Grasp assist captured cube offset: {np.round(self._grasp_assist_offset, 4)}")
+
+    def _apply_grasp_assist(self) -> None:
+        """Keep the grasped cube under the hand until the scripted release phase."""
+        if not OPENVLA_GRASP_ASSIST_ENABLED or self._grasp_assist_offset is None:
+            return
+
+        _, end_effector_position, _ = self.robot.get_current_state()
+        _, cube_orientation = self.cube.get_world_poses()
+        assisted_position = end_effector_position[0] + self._grasp_assist_offset
+        self.cube.set_world_poses(
+            positions=assisted_position.reshape(1, -1),
+            orientations=cube_orientation.numpy(),
+        )
+
+    def _release_grasp_assist(self) -> None:
+        """Disable prototype cube attachment after release."""
+        if self._grasp_assist_offset is not None:
+            print("Grasp assist released")
+        self._grasp_assist_offset = None
+
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
         """Execute one step of the pick-and-place operation using the specified IK method.
 
@@ -416,6 +447,7 @@ class FrankaPickPlace:
         elif self._event == 2:
             if self._step == 0:
                 print("Phase 2: Closing gripper...")
+                self._capture_grasp_assist_offset()
 
             # Close gripper
             self.robot.close_gripper()
@@ -438,6 +470,7 @@ class FrankaPickPlace:
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
+            self._apply_grasp_assist()
 
             self._step += 1
             if self._step >= self.events_dt[3]:
@@ -461,6 +494,7 @@ class FrankaPickPlace:
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
+            self._apply_grasp_assist()
 
             self._step += 1
             if self._step >= self.events_dt[4]:
@@ -478,7 +512,9 @@ class FrankaPickPlace:
                 self.robot.set_end_effector_pose(
                     position=release_position, orientation=goal_orientation, ik_method=ik_method
                 )
+                self._apply_grasp_assist()
             else:
+                self._release_grasp_assist()
                 self.robot.open_gripper()
 
             self._step += 1
@@ -547,6 +583,7 @@ class FrankaPickPlace:
             self._last_vla_action = None
             self._last_vla_event = None
             self._last_vla_step = -1
+            self._grasp_assist_offset = None
 
             print("Robot reset to default state")
         else:
