@@ -145,7 +145,7 @@ class FrankaPickPlace:
             prim_path="/World/OpenVLACamera",
             position=np.array([0.25, 0.0, 1.35]),
             frequency=10,
-            resolution=(224, 224),
+            resolution=(320, 320),
             orientation=rot_utils.euler_angles_to_quats(np.array([0, 90, 0]), degrees=True),
         )
         try:
