@@ -336,18 +336,24 @@ class FrankaPickPlace:
             return None
 
         _, current_position, _ = self.robot.get_current_state()
-        vla_delta = np.clip(action[:3], -0.03, 0.03)
-        scripted_delta = self.target_position - current_position[0]
+        current_position = current_position[0]
+        vla_delta = np.clip(action[:3], -0.02, 0.02)
+        target_above_place = self.target_position + np.array([0.0, 0.0, 0.05])
+        scripted_delta = target_above_place - current_position
 
-        # Blend toward the known target so the VLA can guide but not drift away.
-        if np.linalg.norm(scripted_delta) > 0.03:
-            scripted_delta = 0.03 * scripted_delta / np.linalg.norm(scripted_delta)
-        goal_position = current_position[0] + 0.5 * vla_delta + 0.5 * scripted_delta
+        # Strongly bias toward the known place target; VLA only nudges the carry path.
+        if np.linalg.norm(scripted_delta) > 0.06:
+            scripted_delta = 0.06 * scripted_delta / np.linalg.norm(scripted_delta)
+        goal_position = current_position + 0.2 * vla_delta + 0.8 * scripted_delta
 
-        lower_bounds = self.target_position + np.array([-0.25, -0.25, 0.0])
-        upper_bounds = self.target_position + np.array([0.25, 0.25, 0.25])
-        goal_position = np.clip(goal_position, lower_bounds, upper_bounds)
-        goal_position[2] = max(goal_position[2], self.target_position[2])
+        lower_bounds = self.target_position + np.array([-0.1, -0.1, 0.03])
+        upper_bounds = self.target_position + np.array([0.35, 0.35, 0.3])
+        goal_position[:2] = np.clip(goal_position[:2], lower_bounds[:2], upper_bounds[:2])
+
+        phase_progress = min(1.0, self._step / max(1, self.events_dt[4] - 1))
+        scheduled_z = (1.0 - phase_progress) * max(current_position[2], self.target_position[2] + 0.18)
+        scheduled_z += phase_progress * (self.target_position[2] + 0.05)
+        goal_position[2] = np.clip(goal_position[2], self.target_position[2] + 0.04, scheduled_z)
         return goal_position
 
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
