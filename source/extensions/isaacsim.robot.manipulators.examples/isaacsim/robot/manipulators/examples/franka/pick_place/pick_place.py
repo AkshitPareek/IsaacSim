@@ -13,15 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import List, Optional
 
+import cv2
 import isaacsim.core.experimental.utils.stage as stage_utils
+import isaacsim.core.utils.numpy.rotations as rot_utils
 import numpy as np
+import requests
 from isaacsim.core.experimental.materials import PreviewSurfaceMaterial
 from isaacsim.core.experimental.objects import Cube
 from isaacsim.core.experimental.prims import GeomPrim, RigidPrim
 from isaacsim.robot.manipulators.examples.franka.franka_experimental import FrankaExperimental
+from isaacsim.sensors.camera import Camera
 from isaacsim.storage.native import get_assets_root_path
+
+
+OPENVLA_SERVER_URL = os.getenv("OPENVLA_SERVER_URL", "http://localhost:8000/act")
+OPENVLA_INSTRUCTION = os.getenv("OPENVLA_INSTRUCTION", "pick up the blue cube and place it on the target")
 
 
 class FrankaPickPlace:
@@ -41,6 +50,11 @@ class FrankaPickPlace:
         """
         self.cube = None
         self.robot = None
+        self.camera = None
+        self._last_vla_action = None
+        self._last_vla_step = -1
+        self._vla_query_interval = 15
+        self._vla_enabled = os.getenv("OPENVLA_ENABLED", "1") != "0"
 
         # Define step counts for each phase
         self.events_dt = events_dt
@@ -126,6 +140,104 @@ class FrankaPickPlace:
         self.cube = RigidPrim(paths=cube_shape.paths)
         cube_shape.apply_visual_materials(visual_material)
 
+        self.camera = Camera(
+            prim_path="/World/OpenVLACamera",
+            position=np.array([0.25, 0.0, 1.35]),
+            frequency=10,
+            resolution=(224, 224),
+            orientation=rot_utils.euler_angles_to_quats(np.array([0, 90, 0]), degrees=True),
+        )
+        try:
+            self.camera.initialize()
+        except Exception as exc:
+            print(f"OpenVLA camera initialization failed, using scripted reach: {exc}")
+            self.camera = None
+
+    def _get_scripted_reach_goal(self) -> np.ndarray:
+        """Return the safe scripted Phase 0 reach target above the cube."""
+        cube_pos = self.cube.get_world_poses()[0].numpy()
+        return np.array([cube_pos[0, 0], cube_pos[0, 1], cube_pos[0, 2] + 0.2])
+
+    def _get_vla_rgb_image(self) -> Optional[np.ndarray]:
+        """Read the current RGB camera image for the VLA server."""
+        if self.camera is None:
+            return None
+
+        try:
+            rgb_image = self.camera.get_rgb(device="cpu")
+        except TypeError:
+            rgb_image = self.camera.get_rgb()
+        except Exception as exc:
+            print(f"OpenVLA camera read failed, using scripted reach: {exc}")
+            return None
+
+        if rgb_image is None or rgb_image.size == 0:
+            return None
+        return np.asarray(rgb_image, dtype=np.uint8)
+
+    def _call_openvla(self, rgb_image: np.ndarray) -> Optional[np.ndarray]:
+        """Send an Isaac camera frame to the OpenVLA server and return its 7D action."""
+        bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+        ok, encoded_image = cv2.imencode(".png", bgr_image)
+        if not ok:
+            print("OpenVLA image encoding failed, using scripted reach")
+            return None
+
+        try:
+            response = requests.post(
+                OPENVLA_SERVER_URL,
+                data={"instruction": OPENVLA_INSTRUCTION},
+                files={"image": ("camera.png", encoded_image.tobytes(), "image/png")},
+                timeout=30,
+            )
+            response.raise_for_status()
+            action = np.asarray(response.json()["action"], dtype=np.float32)
+        except Exception as exc:
+            print(f"OpenVLA request failed, using scripted reach: {exc}")
+            return None
+
+        if action.shape[0] < 7:
+            print(f"OpenVLA returned malformed action {action}, using scripted reach")
+            return None
+        return action
+
+    def _get_openvla_action(self) -> Optional[np.ndarray]:
+        """Return a cached OpenVLA action, refreshing every few simulation steps."""
+        if not self._vla_enabled:
+            return None
+
+        should_refresh = self._last_vla_action is None or (
+            self._step - self._last_vla_step >= self._vla_query_interval
+        )
+        if not should_refresh:
+            return self._last_vla_action
+
+        rgb_image = self._get_vla_rgb_image()
+        if rgb_image is None:
+            return self._last_vla_action
+
+        action = self._call_openvla(rgb_image)
+        if action is not None:
+            self._last_vla_action = action
+            self._last_vla_step = self._step
+            print(f"OpenVLA action: {np.round(action, 4)}")
+        return self._last_vla_action
+
+    def _get_vla_reach_goal(self) -> Optional[np.ndarray]:
+        """Convert the VLA translational delta into a clamped end-effector target."""
+        action = self._get_openvla_action()
+        if action is None:
+            return None
+
+        _, current_position, _ = self.robot.get_current_state()
+        delta_position = np.clip(action[:3], -0.03, 0.03)
+        goal_position = current_position[0] + delta_position
+
+        # Keep Phase 0 high enough to avoid early table/cube contact.
+        cube_pos = self.cube.get_world_poses()[0].numpy()
+        goal_position[2] = max(goal_position[2], cube_pos[0, 2] + 0.12)
+        return goal_position
+
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
         """Execute one step of the pick-and-place operation using the specified IK method.
 
@@ -144,11 +256,11 @@ class FrankaPickPlace:
         # Phase 0: Move to x,y position above cube
         if self._event == 0:
             if self._step == 0:
-                print("Phase 0: Moving to x,y position above cube...")
+                print("Phase 0: Moving to x,y position above cube with OpenVLA guidance...")
 
-            # Goal is above the cube at a safe height, matching x,y position
-            cube_pos = self.cube.get_world_poses()[0].numpy()
-            goal_position = np.array([cube_pos[0, 0], cube_pos[0, 1], cube_pos[0, 2] + 0.2])  # Higher above cube
+            goal_position = self._get_vla_reach_goal()
+            if goal_position is None:
+                goal_position = self._get_scripted_reach_goal()
 
             # Use the new high-level method that combines position and orientation
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
@@ -291,6 +403,8 @@ class FrankaPickPlace:
             # Reset state machine
             self._event = 0
             self._step = 0
+            self._last_vla_action = None
+            self._last_vla_step = -1
 
             print("Robot reset to default state")
         else:
