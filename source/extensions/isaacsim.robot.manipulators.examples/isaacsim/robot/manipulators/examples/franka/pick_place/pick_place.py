@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv
 import os
+import time
 from typing import List, Optional
 
 import cv2
@@ -31,6 +33,8 @@ from isaacsim.storage.native import get_assets_root_path
 
 OPENVLA_SERVER_URL = os.getenv("OPENVLA_SERVER_URL", "http://localhost:8000/act")
 OPENVLA_INSTRUCTION = os.getenv("OPENVLA_INSTRUCTION", "pick up the blue cube and place it on the target")
+OPENVLA_LOG_ENABLED = os.getenv("OPENVLA_LOG_ENABLED", "1") != "0"
+OPENVLA_LOG_PATH = os.getenv("OPENVLA_LOG_PATH", "openvla_pick_place_log.csv")
 
 
 class FrankaPickPlace:
@@ -56,6 +60,8 @@ class FrankaPickPlace:
         self._last_vla_step = -1
         self._vla_query_interval = 15
         self._vla_enabled = os.getenv("OPENVLA_ENABLED", "1") != "0"
+        self._run_id = str(int(time.time() * 1000))
+        self._log_header_written = False
 
         # Define step counts for each phase
         self.events_dt = events_dt
@@ -170,6 +176,54 @@ class FrankaPickPlace:
 
         formatted_goal = np.round(np.asarray(goal_position).reshape(-1), 4)
         print(f"Phase {phase}: using {source}; end-effector goal target: {formatted_goal}")
+        self._write_run_log(phase, source, goal_position)
+
+    def _format_array_for_log(self, value: Optional[np.ndarray]) -> str:
+        """Format vectors compactly for CSV cells."""
+        if value is None:
+            return ""
+        return ";".join(f"{x:.6f}" for x in np.asarray(value).reshape(-1))
+
+    def _get_log_cube_position(self) -> Optional[np.ndarray]:
+        """Return the current cube position for run logging."""
+        if self.cube is None:
+            return None
+        try:
+            return self.cube.get_world_poses()[0].numpy().reshape(-1)[:3]
+        except Exception:
+            return None
+
+    def _write_run_log(self, phase: int, source: str, goal_position: np.ndarray) -> None:
+        """Append one VLA controller decision row to the CSV run log."""
+        if not OPENVLA_LOG_ENABLED:
+            return
+
+        log_dir = os.path.dirname(OPENVLA_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        file_exists = os.path.exists(OPENVLA_LOG_PATH)
+        write_header = not file_exists or os.path.getsize(OPENVLA_LOG_PATH) == 0
+        row = {
+            "run_id": self._run_id,
+            "timestamp": f"{time.time():.6f}",
+            "phase": phase,
+            "phase_step": self._step,
+            "goal_source": source,
+            "vla_enabled": int(self._vla_enabled),
+            "instruction": OPENVLA_INSTRUCTION,
+            "vla_action": self._format_array_for_log(self._last_vla_action),
+            "ee_goal": self._format_array_for_log(goal_position),
+            "cube_position": self._format_array_for_log(self._get_log_cube_position()),
+            "target_position": self._format_array_for_log(self.target_position),
+        }
+
+        with open(OPENVLA_LOG_PATH, mode="a", newline="", encoding="utf-8") as log_file:
+            writer = csv.DictWriter(log_file, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            self._log_header_written = True
+            writer.writerow(row)
 
     def _get_vla_rgb_image(self) -> Optional[np.ndarray]:
         """Read the current RGB camera image for the VLA server."""
@@ -342,6 +396,10 @@ class FrankaPickPlace:
             goal_position = self._get_vla_descend_goal(cube_pos)
             if goal_position is None:
                 goal_position = cube_pos + np.array([0.0, 0.0, 0.1])  # Approach from above with safe distance
+                goal_source = "scripted fallback"
+            else:
+                goal_source = "VLA"
+            self._log_vla_guided_goal(1, goal_source, goal_position)
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
