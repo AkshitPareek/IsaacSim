@@ -52,6 +52,7 @@ class FrankaPickPlace:
         self.robot = None
         self.camera = None
         self._last_vla_action = None
+        self._last_vla_event = None
         self._last_vla_step = -1
         self._vla_query_interval = 15
         self._vla_enabled = os.getenv("OPENVLA_ENABLED", "1") != "0"
@@ -158,6 +159,10 @@ class FrankaPickPlace:
         cube_pos = self.cube.get_world_poses()[0].numpy()
         return np.array([cube_pos[0, 0], cube_pos[0, 1], cube_pos[0, 2] + 0.2])
 
+    def _get_scripted_place_goal(self) -> np.ndarray:
+        """Return the safe scripted Phase 4 carry/place target."""
+        return self.target_position
+
     def _get_vla_rgb_image(self) -> Optional[np.ndarray]:
         """Read the current RGB camera image for the VLA server."""
         if self.camera is None:
@@ -206,8 +211,10 @@ class FrankaPickPlace:
         if not self._vla_enabled:
             return None
 
-        should_refresh = self._last_vla_action is None or (
-            self._step - self._last_vla_step >= self._vla_query_interval
+        should_refresh = (
+            self._last_vla_action is None
+            or self._last_vla_event != self._event
+            or self._step - self._last_vla_step >= self._vla_query_interval
         )
         if not should_refresh:
             return self._last_vla_action
@@ -219,8 +226,9 @@ class FrankaPickPlace:
         action = self._call_openvla(rgb_image)
         if action is not None:
             self._last_vla_action = action
+            self._last_vla_event = self._event
             self._last_vla_step = self._step
-            print(f"OpenVLA action: {np.round(action, 4)}")
+            print(f"OpenVLA action for phase {self._event}: {np.round(action, 4)}")
         return self._last_vla_action
 
     def _get_vla_reach_goal(self) -> Optional[np.ndarray]:
@@ -236,6 +244,27 @@ class FrankaPickPlace:
         # Keep Phase 0 high enough to avoid early table/cube contact.
         cube_pos = self.cube.get_world_poses()[0].numpy()
         goal_position[2] = max(goal_position[2], cube_pos[0, 2] + 0.12)
+        return goal_position
+
+    def _get_vla_place_goal(self) -> Optional[np.ndarray]:
+        """Convert the VLA translational delta into a guarded Phase 4 place target."""
+        action = self._get_openvla_action()
+        if action is None:
+            return None
+
+        _, current_position, _ = self.robot.get_current_state()
+        vla_delta = np.clip(action[:3], -0.03, 0.03)
+        scripted_delta = self.target_position - current_position[0]
+
+        # Blend toward the known target so the VLA can guide but not drift away.
+        if np.linalg.norm(scripted_delta) > 0.03:
+            scripted_delta = 0.03 * scripted_delta / np.linalg.norm(scripted_delta)
+        goal_position = current_position[0] + 0.5 * vla_delta + 0.5 * scripted_delta
+
+        lower_bounds = self.target_position + np.array([-0.25, -0.25, 0.0])
+        upper_bounds = self.target_position + np.array([0.25, 0.25, 0.25])
+        goal_position = np.clip(goal_position, lower_bounds, upper_bounds)
+        goal_position[2] = max(goal_position[2], self.target_position[2])
         return goal_position
 
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
@@ -320,12 +349,14 @@ class FrankaPickPlace:
         # Phase 4: Move cube to target location
         elif self._event == 4:
             if self._step == 0:
-                print("Phase 4: Moving cube...")
+                print("Phase 4: Moving cube with OpenVLA guidance...")
+
+            goal_position = self._get_vla_place_goal()
+            if goal_position is None:
+                goal_position = self._get_scripted_place_goal()
 
             # Move to position using the controller
-            self.robot.set_end_effector_pose(
-                position=self.target_position, orientation=goal_orientation, ik_method=ik_method
-            )
+            self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
 
             self._step += 1
             if self._step >= self.events_dt[4]:
@@ -404,6 +435,7 @@ class FrankaPickPlace:
             self._event = 0
             self._step = 0
             self._last_vla_action = None
+            self._last_vla_event = None
             self._last_vla_step = -1
 
             print("Robot reset to default state")
