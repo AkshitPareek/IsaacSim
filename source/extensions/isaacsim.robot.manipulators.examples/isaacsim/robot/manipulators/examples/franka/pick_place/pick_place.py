@@ -338,7 +338,8 @@ class FrankaPickPlace:
         _, current_position, _ = self.robot.get_current_state()
         current_position = current_position[0]
         vla_delta = np.clip(action[:3], -0.02, 0.02)
-        target_above_place = self.target_position + np.array([0.0, 0.0, 0.05])
+        safe_carry_height = self.target_position[2] + 0.22
+        target_above_place = self.target_position + np.array([0.0, 0.0, safe_carry_height - self.target_position[2]])
         scripted_delta = target_above_place - current_position
 
         # Strongly bias toward the known place target; VLA only nudges the carry path.
@@ -351,9 +352,14 @@ class FrankaPickPlace:
         goal_position[:2] = np.clip(goal_position[:2], lower_bounds[:2], upper_bounds[:2])
 
         phase_progress = min(1.0, self._step / max(1, self.events_dt[4] - 1))
-        scheduled_z = (1.0 - phase_progress) * max(current_position[2], self.target_position[2] + 0.18)
-        scheduled_z += phase_progress * (self.target_position[2] + 0.05)
-        goal_position[2] = np.clip(goal_position[2], self.target_position[2] + 0.04, scheduled_z)
+        xy_distance_to_target = np.linalg.norm(goal_position[:2] - self.target_position[:2])
+        descend_progress = np.clip((phase_progress - 0.75) / 0.25, 0.0, 1.0)
+        if xy_distance_to_target > 0.08:
+            descend_progress = 0.0
+
+        release_height = self.target_position[2] + 0.08
+        scheduled_z = (1.0 - descend_progress) * safe_carry_height + descend_progress * release_height
+        goal_position[2] = max(goal_position[2], scheduled_z)
         return goal_position
 
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
