@@ -72,8 +72,8 @@ class FrankaPickPlace:
                 40,  # Phase 1: Approach down to cube
                 20,  # Phase 2: Close gripper to grasp
                 40,  # Phase 3: Lift cube upward
-                80,  # Phase 4: Move cube to target location
-                20,  # Phase 5: Open gripper to release
+                140,  # Phase 4: Slowly carry cube above target location
+                60,  # Phase 5: Lower cube, then open gripper to release
                 20,  # Phase 6: Move up and away
             ]
         self._event = 0
@@ -167,7 +167,7 @@ class FrankaPickPlace:
 
     def _get_scripted_place_goal(self) -> np.ndarray:
         """Return the safe scripted Phase 4 carry/place target."""
-        return self.target_position
+        return self.target_position + np.array([0.0, 0.0, 0.22])
 
     def _log_vla_guided_goal(self, phase: int, source: str, goal_position: np.ndarray) -> None:
         """Log concise VLA phase debug details at the existing VLA cadence."""
@@ -343,23 +343,14 @@ class FrankaPickPlace:
         scripted_delta = target_above_place - current_position
 
         # Strongly bias toward the known place target; VLA only nudges the carry path.
-        if np.linalg.norm(scripted_delta) > 0.06:
-            scripted_delta = 0.06 * scripted_delta / np.linalg.norm(scripted_delta)
-        goal_position = current_position + 0.2 * vla_delta + 0.8 * scripted_delta
+        if np.linalg.norm(scripted_delta) > 0.025:
+            scripted_delta = 0.025 * scripted_delta / np.linalg.norm(scripted_delta)
+        goal_position = current_position + 0.1 * vla_delta + 0.9 * scripted_delta
 
-        lower_bounds = self.target_position + np.array([-0.1, -0.1, 0.03])
-        upper_bounds = self.target_position + np.array([0.35, 0.35, 0.3])
+        lower_bounds = self.target_position + np.array([-0.1, -0.1, safe_carry_height])
+        upper_bounds = self.target_position + np.array([0.35, 0.35, safe_carry_height])
         goal_position[:2] = np.clip(goal_position[:2], lower_bounds[:2], upper_bounds[:2])
-
-        phase_progress = min(1.0, self._step / max(1, self.events_dt[4] - 1))
-        xy_distance_to_target = np.linalg.norm(goal_position[:2] - self.target_position[:2])
-        descend_progress = np.clip((phase_progress - 0.75) / 0.25, 0.0, 1.0)
-        if xy_distance_to_target > 0.08:
-            descend_progress = 0.0
-
-        release_height = self.target_position[2] + 0.08
-        scheduled_z = (1.0 - descend_progress) * safe_carry_height + descend_progress * release_height
-        goal_position[2] = max(goal_position[2], scheduled_z)
+        goal_position[2] = safe_carry_height
         return goal_position
 
     def forward(self, ik_method: str = "damped-least-squares") -> bool:
@@ -439,6 +430,8 @@ class FrankaPickPlace:
             if self._step == 0:
                 print("Phase 3: Lifting cube...")
 
+            self.robot.close_gripper()
+
             # Get current end effector position and lift up
             _, current_position, _ = self.robot.get_current_state()
             goal_position = current_position + np.array([0.0, 0.0, 0.2])
@@ -455,6 +448,8 @@ class FrankaPickPlace:
         elif self._event == 4:
             if self._step == 0:
                 print("Phase 4: Moving cube with OpenVLA guidance...")
+
+            self.robot.close_gripper()
 
             goal_position = self._get_vla_place_goal()
             if goal_position is None:
@@ -475,10 +470,16 @@ class FrankaPickPlace:
         # Phase 5: Open gripper to release cube
         elif self._event == 5:
             if self._step == 0:
-                print("Phase 5: Opening gripper...")
+                print("Phase 5: Lowering cube, then opening gripper...")
 
-            # Open gripper
-            self.robot.open_gripper()
+            release_position = self.target_position + np.array([0.0, 0.0, 0.06])
+            if self._step < int(0.75 * self.events_dt[5]):
+                self.robot.close_gripper()
+                self.robot.set_end_effector_pose(
+                    position=release_position, orientation=goal_orientation, ik_method=ik_method
+                )
+            else:
+                self.robot.open_gripper()
 
             self._step += 1
             if self._step >= self.events_dt[5]:
