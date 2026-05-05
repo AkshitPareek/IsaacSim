@@ -254,6 +254,27 @@ class FrankaPickPlace:
         goal_position[2] = max(goal_position[2], cube_pos[0, 2] + 0.12)
         return goal_position
 
+    def _get_vla_descend_goal(self, cube_pos: np.ndarray) -> Optional[np.ndarray]:
+        """Return a guarded OpenVLA-assisted Phase 1 descend target above the cube."""
+        action = self._get_openvla_action()
+        if action is None:
+            return None
+
+        _, current_position, _ = self.robot.get_current_state()
+        cube_center = cube_pos[0]
+        scripted_goal = cube_center + np.array([0.0, 0.0, 0.1])
+
+        # Use only the VLA translation delta; gripper/action tail never controls grasping.
+        vla_delta = np.clip(action[:3], -0.02, 0.02)
+        vla_goal = current_position[0] + vla_delta
+
+        # Bias strongly back to the known safe target so descent stays predictable.
+        goal_position = 0.35 * vla_goal + 0.65 * scripted_goal
+        xy_margin = 0.05
+        goal_position[:2] = np.clip(goal_position[:2], cube_center[:2] - xy_margin, cube_center[:2] + xy_margin)
+        goal_position[2] = max(goal_position[2], cube_center[2] + 0.08)
+        return goal_position
+
     def _get_vla_place_goal(self) -> Optional[np.ndarray]:
         """Convert the VLA translational delta into a guarded Phase 4 place target."""
         action = self._get_openvla_action()
@@ -314,11 +335,13 @@ class FrankaPickPlace:
         # Phase 1: Approach down to the cube
         elif self._event == 1:
             if self._step == 0:
-                print("Phase 1: Approaching cube...")
+                print("Phase 1: Approaching cube with guarded OpenVLA guidance...")
 
             # Goal is above and slightly behind the cube for proper approach
             cube_pos = self.cube.get_world_poses()[0].numpy()
-            goal_position = cube_pos + np.array([0.0, 0.0, 0.1])  # Approach from above with safe distance
+            goal_position = self._get_vla_descend_goal(cube_pos)
+            if goal_position is None:
+                goal_position = cube_pos + np.array([0.0, 0.0, 0.1])  # Approach from above with safe distance
 
             # Move to position using the controller
             self.robot.set_end_effector_pose(position=goal_position, orientation=goal_orientation, ik_method=ik_method)
