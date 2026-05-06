@@ -180,6 +180,9 @@ New or updated capabilities:
   - `desired_delta_axis = b + wx*vla_dx + wy*vla_dy + wz*vla_dz`
   - train/test split is by `run_id`
   - no Isaac imports and no robot control
+- `fit_vla_action_adapter.py` can write a JSON config with per-phase coefficients and `ready_for_control` metadata:
+  - `--write-config path\to\affine_adapter_config.json`
+  - `--min-test-improvement 10`
 
 Affine adapter result on `vla_calib_logs_balanced_real/calibration.csv`:
 
@@ -192,6 +195,13 @@ Recommended next step:
 - Add a guarded dry-run/live-control scaffold for Phase 1 or Phase 4 first, not Phase 0.
 - Keep Phase 0 scripted until we build a better object-local or waypoint predictor.
 - If the goal remains Phase 0 autonomy first, collect richer visual/action labels or switch the model target from raw deltas to object/waypoint prediction.
+
+Useful config export command:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\fit_vla_action_adapter.py --csv vla_calib_logs_balanced_real\calibration.csv --phase 0,1,4 --holdout-fraction 0.3 --min-test-improvement 10 --write-config vla_calib_logs_balanced_real\affine_adapter_config.json
+```
 
 ## Verification Targets
 
