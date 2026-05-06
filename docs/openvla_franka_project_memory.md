@@ -331,6 +331,57 @@ Adapter dry-run result on the fresh collection:
   - failed gates with `--max-adapter-delta-max 0.08 --max-adapter-error-max 0.1`.
 - Conclusion is stronger now: the affine adapter must not control Phase 4. Phase 1 is the only current candidate for further dry-run investigation, and Phase 0 remains scripted.
 
+## Swarm Round 7 Task List
+
+Milestone: decide whether Phase 1 deserves a dry-run-only promotion path, while rejecting and redesigning the Phase 4 affine adapter.
+
+Current safety decision:
+
+- No live VLA or affine adapter control is approved for any phase.
+- Scripted Franka control remains the only motion authority.
+- Round 7 may promote only Phase 1 dry-run evidence quality, not robot authority.
+- Phase 4 affine adapter output is rejected for control consideration due to repeated large deltas, high error-to-scripted goals, and zero accepted samples in the fresh dry-run collection.
+- Any future Phase 4 work must be treated as adapter redesign, not threshold loosening.
+
+Implementer tasks:
+
+- Implementer K: define Phase 1-only dry-run promotion gates in `analyze_vla_adapter_dryrun.py` or its docs.
+  - Acceptance criteria: gates can be run for phase `1` alone; require enough samples, high accepted rate, bounded p95/max delta norm, bounded p95/max error-to-scripted, no NaN/Inf fields, and no unexplained rejection spikes; the command must fail if Phase 4 is accidentally included as a candidate.
+- Implementer L: collect a larger Phase 1-focused scripted dry-run dataset with balanced targets and current adapter clamps.
+  - Acceptance criteria: scripted control only; at least `15` completed runs or documented simulator failure with partial logs; target labels balanced; scripted final placement quality passes; Phase 1 adapter fields are populated; generated logs are not committed unless explicitly requested.
+- Implementer M: prepare a concise Phase 1 promotion report.
+  - Acceptance criteria: report includes dataset quality gates, Phase 1 adapter dry-run gates, accepted/rejected counts, rejection reasons, delta/error percentiles, worst rows, and a clear recommendation of `continue dry-run`, `redesign`, or `request separate live-control review`.
+- Implementer N: reject and redesign Phase 4 adapter approach.
+  - Acceptance criteria: document why the current affine Phase 4 adapter is blocked; propose a replacement design such as object-local waypoint prediction, phase-specific bounded target selection, or a non-affine/clamped model; include offline and dry-run validation gates before any future Phase 4 control discussion.
+
+Round 7 acceptance gates:
+
+- Phase 1 dry-run promotion requires fresh dataset gates to pass for coverage, label balance, VLA success, latency, empty camera frames, and scripted final placement quality.
+- Phase 1 adapter gates must pass with conservative max-delta and error-to-scripted thresholds, stable acceptance rate, finite numeric fields, and no large outlier proposals.
+- Promotion means only that Phase 1 remains a candidate for more dry-run evidence or a separate lead-reviewed live-control proposal; it does not enable live control.
+- Phase 0 remains scripted.
+- Phase 4 current affine adapter remains rejected even if Phase 1 passes; Phase 4 needs a redesigned adapter and new offline plus dry-run evidence.
+- Any code path that could give VLA/adapter live robot authority remains absent or hard-disabled unless separately approved.
+
+Round 7 data diagnosis:
+
+- Phase 1 looks plausible because it is a local descent problem:
+  - mean delta norm `0.0434 m`
+  - p95 delta norm `0.0505 m`
+  - accepted `22 / 24`
+  - mean error-to-scripted `0.0299 m`
+  - typical deltas are small and mostly vertical, around `(+0.002, -0.001, -0.043)`.
+- Phase 4 fails because the affine adapter emits transport-sized global deltas while runtime treats them as local `ee_pos + adapter_delta` goals:
+  - accepted `0 / 48`
+  - mean delta norm `0.5040 m`
+  - p95 delta norm `0.5706 m`
+  - max delta norm `0.5860 m`
+  - max error-to-scripted `0.7020 m`
+- Phase 4 failure is not caused by target-label imbalance or VLA availability:
+  - dry-run dataset was balanced across red, green, and blue targets
+  - Phase 4 VLA success was `48 / 48`
+- Recommendation: do not extend this affine adapter to Phase 4. Use Phase 1 only as a dry-run scaffold/milestone. The next real autonomy direction should be an object-local adapter that conditions on EE, cube, target, and phase semantics, and outputs bounded local servo steps rather than one-shot global transport deltas.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:
