@@ -54,11 +54,11 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 - [x] Add randomized cube and target positions for dataset coverage.
 - [x] Add dataset analyzer for calibration CSVs.
 - [x] Add VLA query diagnostics, dry-run controls, latency logging, and 7D validation.
-- [ ] Generate a larger randomized observer dataset with real OpenVLA responses.
+- [x] Generate a larger randomized observer dataset with real OpenVLA responses.
 - [x] Add dataset quality gates so bad calibration runs are obvious.
 - [x] Add language-conditioned target variants and target labels/colors.
 - [x] Design a dry-run action adapter that maps VLA/action signals to bounded Franka waypoints.
-- [ ] Validate the adapter offline against logged scripted goals.
+- [x] Validate the adapter offline against logged scripted goals.
 - [ ] Enable model control for Phase 0 reach only.
 - [ ] Expand to language-conditioned place waypoint selection.
 - [ ] Consider full closed-loop policy control only after waypoint phases are stable.
@@ -145,6 +145,32 @@ cd C:\Users\Akshit\Projects\isaacsim
 python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_calibration.py --csv vla_calib_logs_balanced_real\calibration.csv --required-phases 0,1,4 --min-query-successes-per-phase 20 --min-label-count 3 --min-runs-per-label 5 --max-empty-camera-frames 2 --max-vla-latency-p95-ms 10000
 python source\standalone_examples\api\isaacsim.robot.manipulators\franka\report_vla_action_adapter.py --csv vla_calib_logs_balanced_real\calibration.csv --per-phase --diagnose-axes --grid-search-scales 0.05,0.1,0.25,0.5,1.0
 ```
+
+Balanced real dataset result:
+
+- Dataset: `vla_calib_logs_balanced_real/calibration.csv`
+- Runs: `15`
+- Rows: `4200`
+- VLA success: `419 / 420`
+- Labels: `5` runs each for `red target`, `green target`, and `blue target`
+- Query successes by phase: phase `0=89`, `1=60`, `4=120`
+- Latency p95: `2813.13 ms`
+- Run-level placement success-like count: `15 / 15` under `0.08 m` XY final distance.
+- Quality gates passed for required phases, label balance, latency, and empty camera frames.
+
+Offline adapter validation result:
+
+- Phase 0: raw VLA xyz adapter worsened mean distance by `8.63%`.
+- Phase 1: raw VLA xyz adapter worsened mean distance by `13.18%`.
+- Phase 4: raw VLA xyz adapter improved mean distance by `0.90%`.
+- Phase 0 axis diagnostics show poor sign agreement: `x=11.24%`, `y=29.21%`, `z=47.19%`.
+- Conclusion: the dataset is good; the naive raw delta adapter is not ready for Phase 0 live control.
+
+Current next step:
+
+- Build stronger offline calibration tools before live model control.
+- Try phase-specific affine/linear adapters and axis/sign mappings against the balanced dataset.
+- Only enable Phase 0 live control if an offline adapter beats the scripted baseline with enough margin and stable axis diagnostics.
 
 ## Verification Targets
 
