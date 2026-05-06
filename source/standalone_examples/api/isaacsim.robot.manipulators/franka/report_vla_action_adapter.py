@@ -8,12 +8,36 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 
-XYZ_ACTION_FIELDS = ["vla_dx", "vla_dy", "vla_dz"]
+AXES = ("x", "y", "z")
+DEFAULT_PHASES = ("0", "1", "4")
+XYZ_ACTION_FIELDS = ("vla_dx", "vla_dy", "vla_dz")
+
+
+@dataclass(frozen=True)
+class Sample:
+    phase: str
+    action_xyz: tuple[float, float, float]
+    ee_pos: tuple[float, float, float]
+    scripted_goal: tuple[float, float, float]
+
+    @property
+    def desired_delta(self) -> tuple[float, float, float]:
+        return tuple(goal - pos for goal, pos in zip(self.scripted_goal, self.ee_pos))  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class SkipCounts:
+    phase: int = 0
+    vla_error: int = 0
+    missing_action: int = 0
+    missing_pose: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +54,22 @@ def parse_args() -> argparse.Namespace:
         "--phase",
         action="append",
         default=[],
-        help="Optional phase filter. Can be repeated or comma-separated, e.g. --phase 0,1 --phase 4.",
+        help="Optional phase filter. Use 'all', repeat values, or comma-separate phases, e.g. --phase 0,1 --phase 4.",
+    )
+    parser.add_argument(
+        "--per-phase",
+        action="store_true",
+        help="Print separate reports for phases 0, 1, and 4 by default, or for phases selected by --phase.",
+    )
+    parser.add_argument(
+        "--diagnose-axes",
+        action="store_true",
+        help="Print per-axis VLA/desired delta stats, sign agreement, and correlation.",
+    )
+    parser.add_argument(
+        "--try-axis-flips",
+        action="store_true",
+        help="Try all xyz sign-flip combinations and report the best adapted mean error.",
     )
     parser.add_argument(
         "--scale",
@@ -52,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-samples",
         type=int,
-        default=5,
+        default=20,
         help="Minimum usable rows before interpreting the adapter comparison as meaningful.",
     )
     return parser.parse_args()
@@ -77,9 +116,12 @@ def parse_phase_filters(raw_filters: Iterable[str]) -> set[str]:
     phases: set[str] = set()
     for raw_filter in raw_filters:
         for phase in str(raw_filter).split(","):
-            phase = phase.strip()
-            if phase:
-                phases.add(phase)
+            phase = phase.strip().lower()
+            if not phase:
+                continue
+            if phase == "all":
+                return set()
+            phases.add(phase)
     return phases
 
 
@@ -130,8 +172,9 @@ def adapted_goal(
     action_xyz: tuple[float, float, float],
     scale: float,
     clip: float,
+    axis_signs: tuple[int, int, int] = (1, 1, 1),
 ) -> tuple[float, float, float]:
-    clipped = tuple(clip_value(value, clip) for value in action_xyz)
+    clipped = tuple(clip_value(sign * value, clip) for sign, value in zip(axis_signs, action_xyz))
     return tuple(position + scale * delta for position, delta in zip(ee_pos, clipped))  # type: ignore[return-value]
 
 
@@ -141,7 +184,43 @@ def mean(values: list[float]) -> float | None:
     return sum(values) / len(values)
 
 
-def format_number(value: float | None) -> str:
+def stddev(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    avg = sum(values) / len(values)
+    variance = sum((value - avg) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(variance)
+
+
+def correlation(left: list[float], right: list[float]) -> float | None:
+    if len(left) < 3 or len(left) != len(right):
+        return None
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+    left_denominator = math.sqrt(sum((a - left_mean) ** 2 for a in left))
+    right_denominator = math.sqrt(sum((b - right_mean) ** 2 for b in right))
+    denominator = left_denominator * right_denominator
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def sign_agreement(left: list[float], right: list[float]) -> float | None:
+    comparable = 0
+    matching = 0
+    for a, b in zip(left, right):
+        if a == 0 or b == 0:
+            continue
+        comparable += 1
+        if (a > 0) == (b > 0):
+            matching += 1
+    if comparable == 0:
+        return None
+    return 100.0 * matching / comparable
+
+
+def format_number(value: float | int | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:.6g}"
@@ -158,20 +237,15 @@ def load_rows(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
-def analyze_rows(
+def collect_samples(
     rows: list[dict[str, str]],
     phases: set[str],
-    scale: float,
-    clip: float,
-) -> dict[str, object]:
-    used_rows = 0
+) -> tuple[list[Sample], SkipCounts]:
+    samples: list[Sample] = []
     skipped_phase = 0
     skipped_vla_error = 0
     skipped_missing_action = 0
     skipped_missing_pose = 0
-
-    baseline_distances: list[float] = []
-    adapted_distances: list[float] = []
 
     for row in rows:
         phase = (row.get("phase") or "").strip()
@@ -194,10 +268,29 @@ def analyze_rows(
             skipped_missing_pose += 1
             continue
 
-        predicted_goal = adapted_goal(ee_pos, action_xyz, scale, clip)
-        baseline_distances.append(distance_3d(ee_pos, scripted_goal))
-        adapted_distances.append(distance_3d(predicted_goal, scripted_goal))
-        used_rows += 1
+        samples.append(Sample(phase=phase, action_xyz=action_xyz, ee_pos=ee_pos, scripted_goal=scripted_goal))
+
+    return samples, SkipCounts(
+        phase=skipped_phase,
+        vla_error=skipped_vla_error,
+        missing_action=skipped_missing_action,
+        missing_pose=skipped_missing_pose,
+    )
+
+
+def analyze_samples(
+    samples: list[Sample],
+    scale: float,
+    clip: float,
+    axis_signs: tuple[int, int, int] = (1, 1, 1),
+) -> dict[str, object]:
+    baseline_distances: list[float] = []
+    adapted_distances: list[float] = []
+
+    for sample in samples:
+        predicted_goal = adapted_goal(sample.ee_pos, sample.action_xyz, scale, clip, axis_signs)
+        baseline_distances.append(distance_3d(sample.ee_pos, sample.scripted_goal))
+        adapted_distances.append(distance_3d(predicted_goal, sample.scripted_goal))
 
     baseline_mean = mean(baseline_distances)
     adapted_mean = mean(adapted_distances)
@@ -206,11 +299,7 @@ def analyze_rows(
         improvement = 100.0 * (baseline_mean - adapted_mean) / baseline_mean
 
     return {
-        "used_rows": used_rows,
-        "skipped_phase": skipped_phase,
-        "skipped_vla_error": skipped_vla_error,
-        "skipped_missing_action": skipped_missing_action,
-        "skipped_missing_pose": skipped_missing_pose,
+        "used_rows": len(samples),
         "baseline_distances": baseline_distances,
         "adapted_distances": adapted_distances,
         "baseline_mean": baseline_mean,
@@ -219,15 +308,10 @@ def analyze_rows(
     }
 
 
-def grid_search(
-    rows: list[dict[str, str]],
-    phases: set[str],
-    scales: list[float],
-    clip: float,
-) -> list[dict[str, object]]:
+def grid_search(samples: list[Sample], scales: list[float], clip: float) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for scale in scales:
-        report = analyze_rows(rows, phases, scale, clip)
+        report = analyze_samples(samples, scale, clip)
         results.append(
             {
                 "scale": scale,
@@ -239,60 +323,126 @@ def grid_search(
     return results
 
 
-def print_report(
-    csv_path: Path,
-    phases: set[str],
+def best_grid_result(grid_results: list[dict[str, object]]) -> dict[str, object] | None:
+    best = None
+    for result in grid_results:
+        adapted_mean = result["adapted_mean"]
+        if adapted_mean is not None and (best is None or adapted_mean < best["adapted_mean"]):
+            best = result
+    return best
+
+
+def axis_values(samples: list[Sample], axis_index: int) -> tuple[list[float], list[float]]:
+    vla_values = [sample.action_xyz[axis_index] for sample in samples]
+    desired_values = [sample.desired_delta[axis_index] for sample in samples]
+    return vla_values, desired_values
+
+
+def print_axis_diagnostics(samples: list[Sample]) -> None:
+    print()
+    print("Axis Diagnostics")
+    print("axis  vla_mean  vla_std   desired_mean  desired_std  sign_agree  corr")
+    for index, axis in enumerate(AXES):
+        vla_values, desired_values = axis_values(samples, index)
+        print(
+            f"{axis:<4} "
+            f"{format_number(mean(vla_values)):>8} "
+            f"{format_number(stddev(vla_values)):>8} "
+            f"{format_number(mean(desired_values)):>12} "
+            f"{format_number(stddev(desired_values)):>11} "
+            f"{format_percent(sign_agreement(vla_values, desired_values)):>11} "
+            f"{format_number(correlation(vla_values, desired_values)):>8}"
+        )
+
+
+def print_axis_flip_search(samples: list[Sample], scale: float, clip: float) -> None:
+    print()
+    print("Axis Flip Search")
+    best = None
+    for signs in itertools.product((-1, 1), repeat=3):
+        report = analyze_samples(samples, scale, clip, signs)
+        adapted_mean = report["adapted_mean"]
+        sign_text = ",".join(f"{axis}{'+' if sign > 0 else '-'}" for axis, sign in zip(AXES, signs))
+        print(
+            f"signs={sign_text:<8} "
+            f"mean_error={format_number(adapted_mean)} "
+            f"improvement={format_percent(report['improvement'])}"
+        )
+        if adapted_mean is not None and (best is None or adapted_mean < best["adapted_mean"]):
+            best = {"signs": signs, **report}
+
+    if best is not None:
+        best_sign_text = ",".join(f"{axis}{'+' if sign > 0 else '-'}" for axis, sign in zip(AXES, best["signs"]))
+        print(f"best_axis_signs={best_sign_text}")
+
+
+def sorted_phases(phases: Iterable[str]) -> list[str]:
+    return sorted(phases, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
+
+
+def phase_filter_text(phases: set[str]) -> str:
+    if not phases:
+        return "all"
+    return ",".join(sorted_phases(phases))
+
+
+def print_phase_report(
+    label: str,
+    samples: list[Sample],
+    skips: SkipCounts,
     scale: float,
     clip: float,
     min_samples: int,
-    report: dict[str, object],
-    grid_results: list[dict[str, object]],
+    grid_scales: list[float],
+    diagnose_axes: bool,
+    try_axis_flips: bool,
 ) -> None:
-    phase_filter = ",".join(
-        sorted(phases, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
-    )
-    if not phase_filter:
-        phase_filter = "all"
+    report = analyze_samples(samples, scale, clip)
+    grid_results = grid_search(samples, grid_scales, clip)
+    sample_status = "PASS" if len(samples) >= min_samples else "LOW SAMPLE"
 
-    print("Offline VLA Action Adapter Report")
-    print(f"CSV: {csv_path}")
-    print(f"Phase filter: {phase_filter}")
+    print()
+    print(label)
     print(f"Adapter: ee_pos + {scale:.6g} * clip(vla_xyz, +/-{clip:.6g})")
-    print()
-    print("Rows")
-    print(f"Used: {report['used_rows']}")
-    print(f"Skipped by phase: {report['skipped_phase']}")
-    print(f"Skipped VLA errors: {report['skipped_vla_error']}")
-    print(f"Skipped missing action: {report['skipped_missing_action']}")
-    print(f"Skipped missing pose/goal: {report['skipped_missing_pose']}")
+    print(f"Used: {len(samples)}")
+    print(f"Skipped by phase: {skips.phase}")
+    print(f"Skipped VLA errors: {skips.vla_error}")
+    print(f"Skipped missing action: {skips.missing_action}")
+    print(f"Skipped missing pose/goal: {skips.missing_pose}")
     print(f"Minimum samples: {min_samples}")
-    sample_status = "PASS" if int(report["used_rows"]) >= min_samples else "LOW SAMPLE"
     print(f"Sample status: {sample_status}")
-    print()
     print("Distance To Scripted Goal")
     print(f"Baseline ee->scripted mean: {format_number(report['baseline_mean'])}")
     print(f"Adapted predicted->scripted mean: {format_number(report['adapted_mean'])}")
     print(f"Improvement: {format_percent(report['improvement'])}")
 
-    if not grid_results:
-        return
+    if grid_results:
+        print()
+        print("Grid Search")
+        for result in grid_results:
+            print(
+                f"scale={format_number(result['scale'])} "
+                f"used={result['used_rows']} "
+                f"mean_error={format_number(result['adapted_mean'])} "
+                f"improvement={format_percent(result['improvement'])}"
+            )
+        best = best_grid_result(grid_results)
+        if best is not None:
+            print(f"best_scale={format_number(best['scale'])}")
 
-    print()
-    print("Grid Search")
-    best = None
-    for result in grid_results:
-        adapted_mean = result["adapted_mean"]
-        print(
-            f"scale={format_number(result['scale'])} "
-            f"used={result['used_rows']} "
-            f"mean_error={format_number(adapted_mean)} "
-            f"improvement={format_percent(result['improvement'])}"
-        )
-        if adapted_mean is not None and (best is None or adapted_mean < best["adapted_mean"]):
-            best = result
+    if diagnose_axes and samples:
+        print_axis_diagnostics(samples)
 
-    if best is not None:
-        print(f"best_scale={format_number(best['scale'])}")
+    if try_axis_flips and samples:
+        print_axis_flip_search(samples, scale, clip)
+
+
+def per_phase_targets(selected_phases: set[str], rows: list[dict[str, str]]) -> list[str]:
+    if selected_phases:
+        return sorted_phases(selected_phases)
+    phases_in_rows = {str(row.get("phase") or "").strip() for row in rows}
+    defaults = [phase for phase in DEFAULT_PHASES if phase in phases_in_rows or not phases_in_rows]
+    return defaults or list(DEFAULT_PHASES)
 
 
 def main() -> int:
@@ -315,12 +465,44 @@ def main() -> int:
         return 1
 
     rows = load_rows(args.csv)
-    phases = parse_phase_filters(args.phase)
-    report = analyze_rows(rows, phases, args.scale, args.clip)
-    grid_results = grid_search(rows, phases, grid_scales, args.clip)
-    print_report(args.csv, phases, args.scale, args.clip, args.min_samples, report, grid_results)
+    selected_phases = parse_phase_filters(args.phase)
 
-    if int(report["used_rows"]) == 0:
+    print("Offline VLA Action Adapter Report")
+    print(f"CSV: {args.csv}")
+    print(f"Phase filter: {phase_filter_text(selected_phases)}")
+
+    if args.per_phase:
+        phase_used_rows: list[int] = []
+        for phase in per_phase_targets(selected_phases, rows):
+            samples, skips = collect_samples(rows, {phase})
+            phase_used_rows.append(len(samples))
+            print_phase_report(
+                label=f"Phase {phase}",
+                samples=samples,
+                skips=skips,
+                scale=args.scale,
+                clip=args.clip,
+                min_samples=args.min_samples,
+                grid_scales=grid_scales,
+                diagnose_axes=args.diagnose_axes,
+                try_axis_flips=args.try_axis_flips,
+            )
+        return 0 if any(count > 0 for count in phase_used_rows) else 2
+
+    samples, skips = collect_samples(rows, selected_phases)
+    print_phase_report(
+        label="All Selected Rows",
+        samples=samples,
+        skips=skips,
+        scale=args.scale,
+        clip=args.clip,
+        min_samples=args.min_samples,
+        grid_scales=grid_scales,
+        diagnose_axes=args.diagnose_axes,
+        try_axis_flips=args.try_axis_flips,
+    )
+
+    if not samples:
         return 2
     return 0
 
