@@ -18,7 +18,8 @@
 # Usage:
 #   Set OPENVLA_SERVER_URL env var (default: http://localhost:8000/act)
 #   Set OPENVLA_LOG_DIR env var (default: ./vla_calib_logs)
-#   Set OPENVLA_INSTRUCTION env var (default: pick up the blue cube and place it on the target)
+#   Set OPENVLA_TARGET_LABELS env var (default: target)
+#   Set OPENVLA_INSTRUCTION_TEMPLATE env var (default: pick up the blue cube and place it on the {target_label})
 #   Set OPENVLA_QUERY_EVERY env var (default: 10, query VLA every N steps)
 #   Set OPENVLA_ENABLED env var (default: 1)
 #   Set OPENVLA_TIMEOUT env var (default: 15 seconds)
@@ -50,6 +51,13 @@ parser.add_argument("--openvla-enabled", type=int, choices=[0, 1], default=None,
 parser.add_argument("--openvla-timeout", type=float, default=None, help="OpenVLA HTTP timeout in seconds")
 parser.add_argument("--openvla-save-images", type=int, choices=[0, 1], default=None, help="Save calibration camera frames")
 parser.add_argument("--openvla-dry-run", type=int, choices=[0, 1], default=None, help="Log state/images but skip OpenVLA HTTP")
+parser.add_argument("--target-labels", type=str, default=None, help="Comma-separated language labels to sample per run")
+parser.add_argument(
+    "--instruction-template",
+    type=str,
+    default=None,
+    help="Instruction template; supports {target_label} and {target}",
+)
 parser.add_argument(
     "--min-cube-target-distance",
     type=float,
@@ -81,7 +89,6 @@ from isaacsim.sensors.camera import Camera
 
 # ── Config from environment ──────────────────────────────────────────────────
 VLA_SERVER_URL  = os.environ.get("OPENVLA_SERVER_URL", "http://localhost:8000/act")
-VLA_INSTRUCTION = os.environ.get("OPENVLA_INSTRUCTION", "pick up the blue cube and place it on the target")
 VLA_QUERY_EVERY = int(os.environ.get("OPENVLA_QUERY_EVERY", "10"))
 LOG_DIR         = Path(os.environ.get("OPENVLA_LOG_DIR", "./vla_calib_logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,9 +102,12 @@ DEFAULT_CUBE_Y_RANGE = (-0.18, 0.18)
 DEFAULT_TARGET_X_RANGE = (-0.42, -0.20)
 DEFAULT_TARGET_Y_RANGE = (-0.42, -0.18)
 DEFAULT_MIN_CUBE_TARGET_DISTANCE = 0.35
+DEFAULT_TARGET_LABELS = ("target",)
+DEFAULT_INSTRUCTION_TEMPLATE = "pick up the blue cube and place it on the {target_label}"
 
 CSV_FIELDS = [
     "run_id", "phase", "phase_step", "global_step",
+    "target_label", "instruction",
     "scripted_ee_goal_x", "scripted_ee_goal_y", "scripted_ee_goal_z",
     "ee_pos_x", "ee_pos_y", "ee_pos_z",
     "cube_x", "cube_y", "cube_z",
@@ -192,6 +202,44 @@ def configured_seed() -> int | None:
         return args.seed
     raw = os.environ.get("OPENVLA_RANDOM_SEED")
     return None if raw is None or raw == "" else int(raw)
+
+
+def parse_labels(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if raw is None or raw.strip() == "":
+        return default
+    labels = tuple(label.strip() for label in raw.split(",") if label.strip())
+    if not labels:
+        raise ValueError("Target labels must include at least one non-empty label")
+    return labels
+
+
+def configured_target_labels() -> tuple[str, ...]:
+    raw = args.target_labels if args.target_labels is not None else os.environ.get("OPENVLA_TARGET_LABELS")
+    return parse_labels(raw, DEFAULT_TARGET_LABELS)
+
+
+def configured_instruction_template() -> str:
+    if args.instruction_template is not None:
+        template = args.instruction_template
+    else:
+        template = os.environ.get(
+            "OPENVLA_INSTRUCTION_TEMPLATE",
+            os.environ.get("OPENVLA_INSTRUCTION", DEFAULT_INSTRUCTION_TEMPLATE),
+        )
+    if template.strip() == "":
+        raise ValueError("Instruction template must be non-empty")
+    return template
+
+
+def build_instruction(template: str, target_label: str) -> str:
+    try:
+        return template.format(target_label=target_label, target=target_label)
+    except KeyError as e:
+        raise ValueError(f"Unsupported instruction template field: {e}") from e
+
+
+def sample_target_label(rng: np.random.Generator, labels: tuple[str, ...]) -> str:
+    return str(rng.choice(labels))
 
 
 def sample_xy(rng: np.random.Generator, x_range: tuple[float, float], y_range: tuple[float, float]) -> np.ndarray:
@@ -309,6 +357,8 @@ def main():
     cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
     target_y_range = configured_range(args.target_y_range, "OPENVLA_TARGET_Y_RANGE", DEFAULT_TARGET_Y_RANGE)
+    target_labels = configured_target_labels()
+    instruction_template = configured_instruction_template()
     min_distance = (
         args.min_cube_target_distance
         if args.min_cube_target_distance is not None
@@ -330,6 +380,8 @@ def main():
     print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
     print(f"  Target x/y:  {target_x_range} / {target_y_range}")
     print(f"  Min distance:{min_distance}")
+    print(f"  Labels:      {', '.join(target_labels)}")
+    print(f"  Template:    {instruction_template}")
 
     SimulationManager.set_physics_sim_device(args.device)
     simulation_app.update()
@@ -350,6 +402,8 @@ def main():
     run_id        = f"{session_id}_run000"
     current_run   = 0
     reset_needed  = True
+    current_target_label = ""
+    current_instruction = build_instruction(instruction_template, target_labels[0])
 
     print(f"\nStarting calibration data collection (run 1 of {args.runs})...")
 
@@ -372,6 +426,8 @@ def main():
             pick_place.target_position = target_position
             pick_place.reset(cube_position=cube_position)
             simulation_app.update()
+            current_target_label = sample_target_label(rng, target_labels)
+            current_instruction = build_instruction(instruction_template, current_target_label)
             try:
                 cube_readback = as_vec3(pick_place.cube.get_world_poses()[0].numpy()[0])
             except Exception:
@@ -382,6 +438,8 @@ def main():
             print(f"  sampled cube:   {np.round(cube_position, 4)}")
             print(f"  readback cube:  {np.round(cube_readback, 4)}")
             print(f"  sampled target: {np.round(target_position, 4)}")
+            print(f"  target label:   {current_target_label}")
+            print(f"  instruction:    {current_instruction}")
 
         # ── Record state BEFORE scripted step ────────────────────────────────
         phase      = pick_place._event
@@ -425,7 +483,7 @@ def main():
                     if vla_dry_run:
                         print(f"  [ph{phase} s{phase_step:3d}] VLA dry run: HTTP skipped")
                     else:
-                        vla_action, vla_error, vla_latency_ms = query_vla(rgb, VLA_INSTRUCTION, vla_timeout)
+                        vla_action, vla_error, vla_latency_ms = query_vla(rgb, current_instruction, vla_timeout)
                         if vla_action is not None:
                             print(
                                 f"  [ph{phase} s{phase_step:3d}] VLA "
@@ -447,6 +505,8 @@ def main():
             "phase":             phase,
             "phase_step":        phase_step,
             "global_step":       global_step,
+            "target_label":      current_target_label,
+            "instruction":       current_instruction,
             "scripted_ee_goal_x": scripted_goal[0],
             "scripted_ee_goal_y": scripted_goal[1],
             "scripted_ee_goal_z": scripted_goal[2],
