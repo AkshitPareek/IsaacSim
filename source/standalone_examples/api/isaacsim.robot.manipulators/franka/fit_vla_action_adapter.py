@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,18 @@ def parse_args() -> argparse.Namespace:
         help="Scale for the raw clipped VLA baseline.",
     )
     parser.add_argument("--clip", type=float, default=0.03, help="Clip raw VLA xyz deltas for raw baseline.")
+    parser.add_argument(
+        "--min-test-improvement",
+        type=float,
+        default=10.0,
+        help="Minimum held-out improvement percentage before a fitted phase is marked ready.",
+    )
+    parser.add_argument(
+        "--write-config",
+        type=Path,
+        default=None,
+        help="Optional JSON path for fitted coefficients and readiness metadata.",
+    )
     return parser.parse_args()
 
 
@@ -307,8 +320,17 @@ def print_eval(label: str, metrics: dict[str, float | int | None]) -> None:
     print(f"affine mean: {fmt(metrics['affine_mean'])} ({pct(metrics['affine_improvement'])})")
 
 
-def phase_report(phase: str, samples: list[Sample], args: argparse.Namespace) -> bool:
+def phase_report(phase: str, samples: list[Sample], args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
     train, test = split_by_run(samples, args.holdout_fraction)
+    result: dict[str, object] = {
+        "phase": phase,
+        "total_samples": len(samples),
+        "train_samples": len(train),
+        "test_samples": len(test),
+        "ready_for_control": False,
+        "status": "not_evaluated",
+    }
+
     print()
     print(f"Phase {phase}")
     print(f"total samples: {len(samples)}")
@@ -317,21 +339,48 @@ def phase_report(phase: str, samples: list[Sample], args: argparse.Namespace) ->
 
     if len(train) < args.min_train_samples:
         print(f"status: LOW TRAIN SAMPLE (< {args.min_train_samples})")
-        return False
+        result["status"] = "low_train_sample"
+        return False, result
     if len(test) < args.min_test_samples:
         print(f"status: LOW TEST SAMPLE (< {args.min_test_samples})")
-        return False
+        result["status"] = "low_test_sample"
+        return False, result
 
     coefficients = fit_affine_adapter(train, args.ridge)
     if coefficients is None:
         print("status: FIT FAILED")
-        return False
+        result["status"] = "fit_failed"
+        return False, result
+
+    train_metrics = evaluate(train, coefficients, args.compare_raw_scale, args.clip)
+    test_metrics = evaluate(test, coefficients, args.compare_raw_scale, args.clip)
+    test_improvement = test_metrics["affine_improvement"]
+    ready = isinstance(test_improvement, float) and test_improvement >= args.min_test_improvement
+
+    result.update(
+        {
+            "status": "fit_ok",
+            "ready_for_control": ready,
+            "coefficients": {
+                axis: {
+                    "bias": axis_coeffs[0],
+                    "vla_dx": axis_coeffs[1],
+                    "vla_dy": axis_coeffs[2],
+                    "vla_dz": axis_coeffs[3],
+                }
+                for axis, axis_coeffs in zip(AXES, coefficients)
+            },
+            "train": train_metrics,
+            "test": test_metrics,
+        }
+    )
 
     print("status: FIT OK")
+    print(f"ready for control: {'YES' if ready else 'NO'}")
     print_coefficients(coefficients)
-    print_eval("Train", evaluate(train, coefficients, args.compare_raw_scale, args.clip))
-    print_eval("Test", evaluate(test, coefficients, args.compare_raw_scale, args.clip))
-    return True
+    print_eval("Train", train_metrics)
+    print_eval("Test", test_metrics)
+    return True, result
 
 
 def main() -> int:
@@ -347,6 +396,9 @@ def main() -> int:
         return 1
     if args.clip < 0:
         print("--clip must be non-negative")
+        return 1
+    if args.min_test_improvement < 0:
+        print("--min-test-improvement must be non-negative")
         return 1
 
     rows = load_rows(args.csv)
@@ -365,9 +417,27 @@ def main() -> int:
         return 2
 
     any_fit = False
+    phase_results: list[dict[str, object]] = []
     for phase in phases:
         phase_samples = [sample for sample in samples if sample.phase == phase]
-        any_fit = phase_report(phase, phase_samples, args) or any_fit
+        fit_ok, result = phase_report(phase, phase_samples, args)
+        phase_results.append(result)
+        any_fit = fit_ok or any_fit
+
+    if args.write_config is not None:
+        config = {
+            "source_csv": str(args.csv),
+            "adapter_type": "affine_vla_xyz_to_desired_delta",
+            "feature_order": ["bias", "vla_dx", "vla_dy", "vla_dz"],
+            "holdout_fraction": args.holdout_fraction,
+            "ridge": args.ridge,
+            "min_test_improvement": args.min_test_improvement,
+            "phases": phase_results,
+        }
+        args.write_config.parent.mkdir(parents=True, exist_ok=True)
+        args.write_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        print()
+        print(f"Config written to: {args.write_config}")
 
     return 0 if any_fit else 2
 
