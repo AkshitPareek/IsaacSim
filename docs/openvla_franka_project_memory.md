@@ -39,10 +39,36 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 
 ## Initial Task Split
 
-- Lead: refine task list, review implementer plans, keep this memory file current.
-- Implementer A: add randomized cube and target placement to observer runs.
-- Implementer B: add dataset inspection/report tooling for calibration CSV outputs.
-- Implementer C: harden OpenVLA query/logging controls and runtime diagnostics without changing robot control.
+- [x] Lead: refine task list, review implementer plans, keep this memory file current.
+- [x] Implementer A: add randomized cube and target placement to observer runs.
+- [x] Implementer B: add dataset inspection/report tooling for calibration CSV outputs.
+- [x] Implementer C: harden OpenVLA query/logging controls and runtime diagnostics without changing robot control.
+
+## Milestone Checklist
+
+- [x] Restore stable scripted Franka pick-place baseline.
+- [x] Keep OpenVLA out of robot control and move it to observer/calibration mode.
+- [x] Disable Vulkan in local Isaac app configs so Windows launches reliably on this machine.
+- [x] Add D3D12 wrapper examples for explicit renderer testing.
+- [x] Add observer CSV/image logging.
+- [x] Add randomized cube and target positions for dataset coverage.
+- [x] Add dataset analyzer for calibration CSVs.
+- [x] Add VLA query diagnostics, dry-run controls, latency logging, and 7D validation.
+- [ ] Generate a larger randomized observer dataset with real OpenVLA responses.
+- [ ] Add dataset quality gates so bad calibration runs are obvious.
+- [ ] Add language-conditioned target variants and target labels/colors.
+- [ ] Design a dry-run action adapter that maps VLA/action signals to bounded Franka waypoints.
+- [ ] Validate the adapter offline against logged scripted goals.
+- [ ] Enable model control for Phase 0 reach only.
+- [ ] Expand to language-conditioned place waypoint selection.
+- [ ] Consider full closed-loop policy control only after waypoint phases are stable.
+
+## Swarm Round 2 Task Split
+
+- [ ] Lead: turn the next milestone into concrete branch tasks and review implementer plans.
+- [ ] Implementer D: add dataset quality gates/report thresholds to the analyzer.
+- [ ] Implementer E: add target variants, labels, and language templates in observer mode.
+- [ ] Implementer F: design and implement an offline dry-run action adapter report without robot control.
 
 ## Verification Targets
 
