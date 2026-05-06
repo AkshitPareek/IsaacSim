@@ -469,6 +469,46 @@ Round 10 strict gates:
 - Fail: any log/report/decision promotes Phase 4, treats old `ready_for_control` metadata as current approval, or implies VLA/adapter has robot authority.
 - Safety rule: passing Round 10 improves documentation and review hygiene only; it does not enable live control.
 
+## Completed Swarm Round 10
+
+Collection:
+
+- Command: scripted-control Isaac Sim collection with real OpenVLA queries, affine adapter dry-run logging, and `--adapter-enabled-phases 1`.
+- Log directory: `vla_calib_logs_phase1_adapter_dryrun_round10`.
+- Scope: `15` runs, balanced target labels, `5` runs each for red/green/blue.
+- Safety: scripted Franka remained the only motion authority; OpenVLA and adapter outputs were observer-only.
+
+Dataset gate result:
+
+- Overall: PASS.
+- Rows/runs: `4200` rows, `15 / 15` runs.
+- VLA: `419 / 420` successes, `1` empty camera frame, latency p95 `2807.48 ms`.
+- Labels: red/green/blue balanced at `5` runs each.
+- Final scripted placement: `15 / 15` success-like runs, final distance mean `0.0307576 m`, max `0.0669118 m`, under the strict `0.08 m` gate.
+
+Phase 1 adapter dry-run gate result:
+
+- Overall: PASS.
+- Phase 1 samples: `60`.
+- VLA successes: `60 / 60`.
+- Adapter ready: `60 / 60`.
+- Adapter accepted: `55 / 60` (`0.917`).
+- Delta norm: mean `0.0438247 m`, p95 `0.0505235 m`, max `0.0506179 m`.
+- Error to scripted: mean `0.0306145 m`, p95 `0.0592297 m`, max `0.061037 m`.
+- Rejections: `5` tiny cap misses just above `0.05 m`; no large Phase 1 outliers.
+
+Phase 4 safety check:
+
+- Intentional Phase 4 candidate gate: FAIL, as desired.
+- Phase 4 VLA observations existed (`120 / 120` successes), but adapter candidate samples were disabled by the Phase 1 allowlist.
+- Phase 4 adapter-ready rate was `0 / 120`, with rejection reason `phase disabled by adapter phase allowlist`.
+
+Round 10 decision:
+
+- Phase 1 now has a clean larger dry-run evidence set.
+- Phase 4 remains blocked.
+- Passing Round 10 does not enable live control; next work should be a separate lead-reviewed Phase 1-only live-control design gate or another dry-run focused on replacing scripted Phase 1 with a bounded controller shadow plan.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:
