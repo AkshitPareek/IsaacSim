@@ -55,8 +55,8 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 - [x] Add dataset analyzer for calibration CSVs.
 - [x] Add VLA query diagnostics, dry-run controls, latency logging, and 7D validation.
 - [ ] Generate a larger randomized observer dataset with real OpenVLA responses.
-- [ ] Add dataset quality gates so bad calibration runs are obvious.
-- [ ] Add language-conditioned target variants and target labels/colors.
+- [x] Add dataset quality gates so bad calibration runs are obvious.
+- [x] Add language-conditioned target variants and target labels/colors.
 - [ ] Design a dry-run action adapter that maps VLA/action signals to bounded Franka waypoints.
 - [ ] Validate the adapter offline against logged scripted goals.
 - [ ] Enable model control for Phase 0 reach only.
@@ -66,9 +66,27 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 ## Swarm Round 2 Task Split
 
 - [ ] Lead: turn the next milestone into concrete branch tasks and review implementer plans.
-- [ ] Implementer D: add dataset quality gates/report thresholds to the analyzer.
-- [ ] Implementer E: add target variants, labels, and language templates in observer mode.
+- [x] Implementer D: add dataset quality gates/report thresholds to the analyzer.
+- [x] Implementer E: add target variants, labels, and language templates in observer mode.
 - [ ] Implementer F: design and implement an offline dry-run action adapter report without robot control.
+
+## Completed Swarm Round 2 So Far
+
+Merged branches:
+
+- `codex/openvla-quality-gates`
+- `codex/openvla-target-variants`
+
+New or updated capabilities:
+
+- `analyze_vla_calibration.py` can enforce optional quality gates and exits nonzero when requested gates fail.
+- `vla_pick_place.py` logs per-run `target_label` and `instruction`.
+- `vla_pick_place.py` supports target labels and instruction templates while keeping robot control scripted.
+
+Test evidence:
+
+- Quality gates pass syntax checks and fail as expected for impossible thresholds such as `--min-runs 999`.
+- Target variants completed 3 dry-run scripted runs with `green target`, `red target`, and `blue target`.
 
 ## Verification Targets
 
