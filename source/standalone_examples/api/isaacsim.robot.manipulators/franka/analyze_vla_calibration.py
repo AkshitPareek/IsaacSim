@@ -134,6 +134,7 @@ def analyze(csv_path: Path) -> dict[str, object]:
     target_y = [value for row in rows if (value := to_float(row.get("target_y"))) is not None]
 
     missing_images = sum(1 for row in rows if is_missing_image(row, csv_path))
+    latencies_ms = [value for row in rows if (value := to_float(row.get("vla_latency_ms"))) is not None]
 
     ee_goal_distances: list[float] = []
     for row in rows:
@@ -156,6 +157,7 @@ def analyze(csv_path: Path) -> dict[str, object]:
         "target_x": target_x,
         "target_y": target_y,
         "missing_images": missing_images,
+        "latencies_ms": latencies_ms,
         "ee_goal_distances": ee_goal_distances,
     }
 
@@ -166,6 +168,8 @@ def print_report(report: dict[str, object]) -> None:
 
     ee_goal_distances = report["ee_goal_distances"]
     assert isinstance(ee_goal_distances, list)
+    latencies_ms = report["latencies_ms"]
+    assert isinstance(latencies_ms, list)
 
     phase_report = ", ".join(f"{phase}={count}" for phase, count in sorted(phases.items()))
     if not phase_report:
@@ -182,6 +186,9 @@ def print_report(report: dict[str, object]) -> None:
     print(f"Success: {report['vla_success_count']}")
     print(f"Errors: {report['vla_error_count']}")
     print(f"Incomplete actions: {report['vla_incomplete_count']}")
+    print(f"Latency samples: {len(latencies_ms)}")
+    print(f"Latency mean ms: {format_number(mean(latencies_ms))}")
+    print(f"Latency max ms: {format_number(max(latencies_ms) if latencies_ms else None)}")
     print()
     print("Scene Coverage")
     print(f"Cube X: {format_range(report['cube_x'])}")

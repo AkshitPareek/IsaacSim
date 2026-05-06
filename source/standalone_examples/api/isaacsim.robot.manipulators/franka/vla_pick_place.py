@@ -20,6 +20,10 @@
 #   Set OPENVLA_LOG_DIR env var (default: ./vla_calib_logs)
 #   Set OPENVLA_INSTRUCTION env var (default: pick up the blue cube and place it on the target)
 #   Set OPENVLA_QUERY_EVERY env var (default: 10, query VLA every N steps)
+#   Set OPENVLA_ENABLED env var (default: 1)
+#   Set OPENVLA_TIMEOUT env var (default: 15 seconds)
+#   Set OPENVLA_SAVE_IMAGES env var (default: 1)
+#   Set OPENVLA_DRY_RUN env var (default: 0, save/log frames but skip HTTP)
 #
 #   .\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares
 
@@ -42,6 +46,10 @@ parser.add_argument("--cube-x-range", type=float, nargs=2, default=None, metavar
 parser.add_argument("--cube-y-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
 parser.add_argument("--target-x-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
 parser.add_argument("--target-y-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+parser.add_argument("--openvla-enabled", type=int, choices=[0, 1], default=None, help="Enable OpenVLA HTTP queries")
+parser.add_argument("--openvla-timeout", type=float, default=None, help="OpenVLA HTTP timeout in seconds")
+parser.add_argument("--openvla-save-images", type=int, choices=[0, 1], default=None, help="Save calibration camera frames")
+parser.add_argument("--openvla-dry-run", type=int, choices=[0, 1], default=None, help="Log state/images but skip OpenVLA HTTP")
 parser.add_argument(
     "--min-cube-target-distance",
     type=float,
@@ -95,6 +103,7 @@ CSV_FIELDS = [
     "cube_x", "cube_y", "cube_z",
     "target_x", "target_y", "target_z",
     "vla_queried",
+    "vla_latency_ms",
     "vla_dx", "vla_dy", "vla_dz", "vla_droll", "vla_dpitch", "vla_dyaw", "vla_gripper",
     "vla_error",
     "image_path",
@@ -141,6 +150,26 @@ def env_float_pair(name: str, default: tuple[float, float]) -> tuple[float, floa
 def env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return default if raw is None or raw == "" else float(raw)
+
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def configured_flag(arg_value: int | None, env_name: str, default: bool) -> bool:
+    if arg_value is not None:
+        return bool(arg_value)
+    return env_flag(env_name, default)
+
+
+def configured_timeout() -> float:
+    timeout = args.openvla_timeout if args.openvla_timeout is not None else env_float("OPENVLA_TIMEOUT", 15.0)
+    if timeout <= 0:
+        raise ValueError("OPENVLA_TIMEOUT must be positive")
+    return timeout
 
 
 def validate_range(name: str, values: tuple[float, float]) -> tuple[float, float]:
@@ -198,27 +227,35 @@ def sample_scene_positions(
 
 
 # ── VLA query ─────────────────────────────────────────────────────────────────
-def query_vla(rgb_image: np.ndarray, instruction: str):
+def query_vla(rgb_image: np.ndarray, instruction: str, timeout: float):
     """
-    Send image to OpenVLA server. Returns (action_array, error_str).
+    Send image to OpenVLA server. Returns (action_array, error_str, latency_ms).
     action_array is [dx, dy, dz, droll, dpitch, dyaw, gripper] or None.
     """
+    start_time = time.perf_counter()
     try:
         import cv2
         ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb_image.astype(np.uint8), cv2.COLOR_RGB2BGR))
         if not ok:
-            return None, "cv2 encode failed"
+            return None, "cv2 encode failed", ""
         response = requests.post(
             VLA_SERVER_URL,
             data={"instruction": instruction},
             files={"image": ("camera.png", io.BytesIO(buf.tobytes()), "image/png")},
-            timeout=15,
+            timeout=timeout,
         )
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
         response.raise_for_status()
-        action = np.array(response.json()["action"], dtype=np.float32)
-        return action, ""
+        payload = response.json()
+        if "action" not in payload:
+            return None, "response missing action field", f"{latency_ms:.3f}"
+        action = np.array(payload["action"], dtype=np.float32).reshape(-1)
+        if action.size != 7:
+            return None, f"expected 7D action, got {action.size}D", f"{latency_ms:.3f}"
+        return action, "", f"{latency_ms:.3f}"
     except Exception as e:
-        return None, str(e)
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        return None, str(e), f"{latency_ms:.3f}"
 
 
 def as_vec3(value) -> np.ndarray:
@@ -264,6 +301,10 @@ def get_scripted_goal(pick_place: FrankaPickPlace) -> np.ndarray:
 def main():
     seed = configured_seed()
     rng = np.random.default_rng(seed)
+    vla_enabled = configured_flag(args.openvla_enabled, "OPENVLA_ENABLED", True)
+    vla_save_images = configured_flag(args.openvla_save_images, "OPENVLA_SAVE_IMAGES", True)
+    vla_dry_run = configured_flag(args.openvla_dry_run, "OPENVLA_DRY_RUN", False)
+    vla_timeout = configured_timeout()
     cube_x_range = configured_range(args.cube_x_range, "OPENVLA_CUBE_X_RANGE", DEFAULT_CUBE_X_RANGE)
     cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
@@ -278,8 +319,12 @@ def main():
 
     print(f"VLA Calibration Experiment")
     print(f"  Runs:        {args.runs}")
+    print(f"  VLA enabled: {int(vla_enabled)}")
     print(f"  VLA server:  {VLA_SERVER_URL}")
     print(f"  Query every: {VLA_QUERY_EVERY} steps")
+    print(f"  Timeout:     {vla_timeout:g} seconds")
+    print(f"  Save images: {int(vla_save_images)}")
+    print(f"  Dry run:     {int(vla_dry_run)}")
     print(f"  Log dir:     {LOG_DIR}")
     print(f"  Random seed: {seed if seed is not None else 'system entropy'}")
     print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
@@ -356,27 +401,41 @@ def main():
         scripted_goal = as_vec3(get_scripted_goal(pick_place))
 
         # ── Decide whether to query VLA this step ────────────────────────────
-        do_vla_query = (global_step % VLA_QUERY_EVERY == 0) and (phase < len(pick_place.events_dt))
+        should_sample_vla = (
+            vla_enabled
+            and (global_step % VLA_QUERY_EVERY == 0)
+            and (phase < len(pick_place.events_dt))
+        )
+        do_vla_query = should_sample_vla and not vla_dry_run
         vla_action   = None
         vla_error    = ""
+        vla_latency_ms = ""
         image_path   = ""
 
-        if do_vla_query:
+        if should_sample_vla:
             try:
                 rgb = camera.get_rgb()
                 if rgb is not None and rgb.size > 0:
-                    # Save image
-                    fname = IMAGE_DIR / f"run{run_id}_ph{phase}_s{phase_step:04d}.png"
-                    import cv2
-                    cv2.imwrite(str(fname), cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
-                    image_path = str(fname)
+                    if vla_save_images:
+                        fname = IMAGE_DIR / f"run{run_id}_ph{phase}_s{phase_step:04d}.png"
+                        import cv2
+                        cv2.imwrite(str(fname), cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+                        image_path = str(fname)
 
-                    # Query VLA
-                    vla_action, vla_error = query_vla(rgb, VLA_INSTRUCTION)
-                    if vla_action is not None:
-                        print(f"  [ph{phase} s{phase_step:3d}] VLA: {np.round(vla_action, 4)}")
+                    if vla_dry_run:
+                        print(f"  [ph{phase} s{phase_step:3d}] VLA dry run: HTTP skipped")
                     else:
-                        print(f"  [ph{phase} s{phase_step:3d}] VLA error: {vla_error[:60]}")
+                        vla_action, vla_error, vla_latency_ms = query_vla(rgb, VLA_INSTRUCTION, vla_timeout)
+                        if vla_action is not None:
+                            print(
+                                f"  [ph{phase} s{phase_step:3d}] VLA "
+                                f"({vla_latency_ms} ms): {np.round(vla_action, 4)}"
+                            )
+                        else:
+                            print(
+                                f"  [ph{phase} s{phase_step:3d}] VLA error "
+                                f"({vla_latency_ms} ms): {vla_error[:60]}"
+                            )
                 else:
                     vla_error = "empty camera frame"
             except Exception as e:
@@ -401,6 +460,7 @@ def main():
             "target_y":          pick_place.target_position[1],
             "target_z":          pick_place.target_position[2],
             "vla_queried":       int(do_vla_query),
+            "vla_latency_ms":    vla_latency_ms,
             "vla_dx":            vla_action[0] if vla_action is not None else "",
             "vla_dy":            vla_action[1] if vla_action is not None else "",
             "vla_dz":            vla_action[2] if vla_action is not None else "",
