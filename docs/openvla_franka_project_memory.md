@@ -203,6 +203,39 @@ cd C:\Users\Akshit\Projects\isaacsim
 python source\standalone_examples\api\isaacsim.robot.manipulators\franka\fit_vla_action_adapter.py --csv vla_calib_logs_balanced_real\calibration.csv --phase 0,1,4 --holdout-fraction 0.3 --min-test-improvement 10 --write-config vla_calib_logs_balanced_real\affine_adapter_config.json
 ```
 
+## Completed Swarm Round 5 Local Pass
+
+New or updated capabilities:
+
+- `vla_pick_place.py` can load an affine adapter config in observer-only mode:
+  - `--adapter-config` / `OPENVLA_ADAPTER_CONFIG`
+  - `--adapter-dry-run` / `OPENVLA_ADAPTER_DRY_RUN`
+  - `--adapter-max-delta` / `OPENVLA_ADAPTER_MAX_DELTA`
+- The observer CSV now records adapter dry-run fields:
+  - readiness, acceptance, rejection reason
+  - proposed goal, proposed delta, delta norm
+  - distance from proposed adapter goal to scripted goal
+- `fit_vla_action_adapter.py` now writes numeric phase IDs in exported JSON configs, while the live loader remains backward-compatible with string phase IDs.
+
+Dry-run evidence:
+
+- One full D3D12 scripted run completed in `vla_calib_logs_adapter_dryrun_test` after the adapter loader patch.
+- A follow-up run in `vla_calib_logs_adapter_dryrun_test2` populated adapter fields before an Isaac/PhysX shutdown crash.
+- Phase 1 dry-run sample looked plausible:
+  - adapter error to scripted goal: `0.0136 m`
+  - adapter delta norm: about `0.0313 m`
+- Phase 4 dry-run sample looked unsafe despite the offline held-out score:
+  - adapter error to scripted goal: `1.5277 m`
+  - adapter delta norm: about `0.4038 m`
+  - likely caused by the affine phase 4 fit amplifying a repeated OpenVLA xyz action.
+
+Conclusion:
+
+- Do not enable affine adapter live control yet, including Phase 4.
+- Keep using the scripted controller for motion while logging adapter dry-run proposals.
+- Next safe step is to collect more dry-run adapter rows and gate by live dry-run behavior, not only offline split metrics.
+- For live autonomy, prefer a bounded waypoint/object-local predictor or a much stricter adapter with clamps and phase-specific validation.
+
 ## Verification Targets
 
 - Python syntax checks pass for changed standalone scripts/tools.

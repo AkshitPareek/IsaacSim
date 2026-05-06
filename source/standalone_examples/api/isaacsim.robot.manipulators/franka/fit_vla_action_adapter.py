@@ -299,6 +299,10 @@ def sorted_phases(phases: Iterable[str]) -> list[str]:
     return sorted(phases, key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
 
 
+def serialize_phase_id(phase: str) -> int | str:
+    return int(phase) if phase.isdigit() else phase
+
+
 def print_coefficients(coefficients: list[list[float]]) -> None:
     print("Affine coefficients: desired_delta_axis = b + wx*vla_dx + wy*vla_dy + wz*vla_dz")
     print("axis       b        wx        wy        wz")
@@ -323,7 +327,7 @@ def print_eval(label: str, metrics: dict[str, float | int | None]) -> None:
 def phase_report(phase: str, samples: list[Sample], args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
     train, test = split_by_run(samples, args.holdout_fraction)
     result: dict[str, object] = {
-        "phase": phase,
+        "phase": serialize_phase_id(phase),
         "total_samples": len(samples),
         "train_samples": len(train),
         "test_samples": len(test),

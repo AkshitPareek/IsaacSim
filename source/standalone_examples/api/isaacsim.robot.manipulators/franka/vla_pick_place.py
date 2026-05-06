@@ -27,12 +27,16 @@
 #   Set OPENVLA_TIMEOUT env var (default: 15 seconds)
 #   Set OPENVLA_SAVE_IMAGES env var (default: 1)
 #   Set OPENVLA_DRY_RUN env var (default: 0, save/log frames but skip HTTP)
+#   Set OPENVLA_ADAPTER_CONFIG env var to an affine adapter JSON for dry-run goal logging
+#   Set OPENVLA_ADAPTER_DRY_RUN env var (default: 1 when adapter config is supplied)
+#   Set OPENVLA_ADAPTER_MAX_DELTA env var (default: 0.08 meters, reject larger dry-run deltas)
 #
 #   .\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 parser = argparse.ArgumentParser()
@@ -78,6 +82,25 @@ parser.add_argument(
     type=float,
     default=None,
     help="Minimum XY distance between randomized cube and target positions",
+)
+parser.add_argument(
+    "--adapter-config",
+    type=str,
+    default=None,
+    help="Optional affine adapter config JSON for observer-only dry-run goal logging",
+)
+parser.add_argument(
+    "--adapter-dry-run",
+    type=int,
+    choices=[0, 1],
+    default=None,
+    help="Compute/log adapter goals from VLA actions without controlling the robot",
+)
+parser.add_argument(
+    "--adapter-max-delta",
+    type=float,
+    default=None,
+    help="Maximum affine adapter delta norm accepted for dry-run safety logging",
 )
 args, _ = parser.parse_known_args()
 
@@ -133,6 +156,13 @@ CSV_FIELDS = [
     "vla_latency_ms",
     "vla_dx", "vla_dy", "vla_dz", "vla_droll", "vla_dpitch", "vla_dyaw", "vla_gripper",
     "vla_error",
+    "adapter_ready",
+    "adapter_accepted",
+    "adapter_rejected_reason",
+    "adapter_goal_x", "adapter_goal_y", "adapter_goal_z",
+    "adapter_delta_x", "adapter_delta_y", "adapter_delta_z",
+    "adapter_delta_norm",
+    "adapter_error_to_scripted",
     "image_path",
 ]
 
@@ -197,6 +227,24 @@ def configured_timeout() -> float:
     if timeout <= 0:
         raise ValueError("OPENVLA_TIMEOUT must be positive")
     return timeout
+
+
+def configured_adapter_config_path() -> Path | None:
+    raw = args.adapter_config if args.adapter_config is not None else os.environ.get("OPENVLA_ADAPTER_CONFIG", "")
+    if raw is None or raw.strip() == "":
+        return None
+    return Path(raw)
+
+
+def configured_adapter_max_delta() -> float:
+    max_delta = (
+        args.adapter_max_delta
+        if args.adapter_max_delta is not None
+        else env_float("OPENVLA_ADAPTER_MAX_DELTA", 0.08)
+    )
+    if max_delta <= 0:
+        raise ValueError("OPENVLA_ADAPTER_MAX_DELTA must be positive")
+    return max_delta
 
 
 def validate_range(name: str, values: tuple[float, float]) -> tuple[float, float]:
@@ -271,6 +319,52 @@ def build_instruction(template: str, target_label: str) -> str:
         return template.format(target_label=target_label, target=target_label)
     except KeyError as e:
         raise ValueError(f"Unsupported instruction template field: {e}") from e
+
+
+def load_adapter_config(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    with path.open(encoding="utf-8") as file:
+        config = json.load(file)
+    if not isinstance(config, dict) or not isinstance(config.get("phases"), list):
+        raise ValueError(f"Adapter config must contain a phases list: {path}")
+    print(f"Loaded OpenVLA adapter config: {path}")
+    return config
+
+
+def adapter_phase_config(config: dict[str, object], phase: int) -> dict[str, object] | None:
+    phases = config.get("phases", [])
+    if not isinstance(phases, list):
+        return None
+    phase_key = str(phase)
+    for phase_config in phases:
+        if isinstance(phase_config, dict) and str(phase_config.get("phase")) == phase_key:
+            return phase_config
+    return None
+
+
+def compute_adapter_delta(phase_config: dict[str, object], vla_action: np.ndarray) -> np.ndarray | None:
+    if not bool(phase_config.get("ready_for_control", False)):
+        return None
+    coefficients = phase_config.get("coefficients", {})
+    if not isinstance(coefficients, dict):
+        raise ValueError("Adapter phase config is missing coefficients")
+
+    features = {
+        "bias": 1.0,
+        "vla_dx": float(vla_action[0]),
+        "vla_dy": float(vla_action[1]),
+        "vla_dz": float(vla_action[2]),
+    }
+    delta = []
+    for axis in ("x", "y", "z"):
+        axis_coefficients = coefficients.get(axis)
+        if not isinstance(axis_coefficients, dict):
+            raise ValueError(f"Adapter phase config is missing {axis} coefficients")
+        delta.append(
+            sum(float(axis_coefficients.get(name, 0.0)) * value for name, value in features.items())
+        )
+    return np.array(delta, dtype=np.float32)
 
 
 def sample_target_label(rng: np.random.Generator, labels: tuple[str, ...]) -> str:
@@ -409,6 +503,9 @@ def main():
     vla_save_images = configured_flag(args.openvla_save_images, "OPENVLA_SAVE_IMAGES", True)
     vla_dry_run = configured_flag(args.openvla_dry_run, "OPENVLA_DRY_RUN", False)
     vla_timeout = configured_timeout()
+    adapter_config = load_adapter_config(configured_adapter_config_path())
+    adapter_dry_run = configured_flag(args.adapter_dry_run, "OPENVLA_ADAPTER_DRY_RUN", adapter_config is not None)
+    adapter_max_delta = configured_adapter_max_delta()
     cube_x_range = configured_range(args.cube_x_range, "OPENVLA_CUBE_X_RANGE", DEFAULT_CUBE_X_RANGE)
     cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
@@ -429,6 +526,10 @@ def main():
 
     estimated_vla_samples = estimate_vla_samples(total_runs)
     estimated_http_calls = 0 if (not vla_enabled or vla_dry_run) else estimated_vla_samples
+    if adapter_dry_run and adapter_config is None:
+        print("Adapter dry-run requested but no adapter config was supplied; adapter fields will be blank.")
+    elif adapter_config is not None and not adapter_dry_run:
+        print("Adapter config supplied but adapter dry-run is disabled; adapter fields will be blank.")
 
     print(f"VLA Calibration Experiment")
     print(f"  Runs:        {total_runs}")
@@ -440,6 +541,8 @@ def main():
     print(f"  Timeout:     {vla_timeout:g} seconds")
     print(f"  Save images: {int(vla_save_images)}")
     print(f"  Dry run:     {int(vla_dry_run)}")
+    print(f"  Adapter dry: {int(adapter_dry_run)}")
+    print(f"  Adapter max delta: {adapter_max_delta:g} m")
     print(f"  Log dir:     {LOG_DIR}")
     print(f"  Random seed: {seed if seed is not None else 'system entropy'}")
     print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
@@ -547,6 +650,13 @@ def main():
         vla_error    = ""
         vla_latency_ms = ""
         image_path   = ""
+        adapter_ready = ""
+        adapter_accepted = ""
+        adapter_rejected_reason = ""
+        adapter_goal = None
+        adapter_delta = None
+        adapter_delta_norm = ""
+        adapter_error_to_scripted = ""
 
         if should_sample_vla:
             try:
@@ -576,6 +686,27 @@ def main():
                     vla_error = "empty camera frame"
             except Exception as e:
                 vla_error = str(e)
+
+        if adapter_dry_run and adapter_config is not None and vla_action is not None:
+            phase_config = adapter_phase_config(adapter_config, phase)
+            if phase_config is not None:
+                adapter_ready = int(bool(phase_config.get("ready_for_control", False)))
+                adapter_delta = compute_adapter_delta(phase_config, vla_action)
+                if adapter_delta is not None:
+                    adapter_delta_norm = float(np.linalg.norm(adapter_delta))
+                    adapter_goal = ee_pos + adapter_delta
+                    adapter_error_to_scripted = float(np.linalg.norm(adapter_goal - scripted_goal))
+                    adapter_accepted = int(adapter_delta_norm <= adapter_max_delta)
+                    if not adapter_accepted:
+                        adapter_rejected_reason = (
+                            f"delta_norm {adapter_delta_norm:.4f} > max {adapter_max_delta:.4f}"
+                        )
+                    print(
+                        f"  [ph{phase} s{phase_step:3d}] adapter dry-run goal "
+                        f"{np.round(adapter_goal, 4)} "
+                        f"(error to scripted {adapter_error_to_scripted:.4f} m, "
+                        f"accepted={adapter_accepted})"
+                    )
 
         # ── Log row ───────────────────────────────────────────────────────────
         row = {
@@ -607,6 +738,17 @@ def main():
             "vla_dyaw":          vla_action[5] if vla_action is not None else "",
             "vla_gripper":       vla_action[6] if vla_action is not None else "",
             "vla_error":         vla_error,
+            "adapter_ready":      adapter_ready,
+            "adapter_accepted":   adapter_accepted,
+            "adapter_rejected_reason": adapter_rejected_reason,
+            "adapter_goal_x":     adapter_goal[0] if adapter_goal is not None else "",
+            "adapter_goal_y":     adapter_goal[1] if adapter_goal is not None else "",
+            "adapter_goal_z":     adapter_goal[2] if adapter_goal is not None else "",
+            "adapter_delta_x":    adapter_delta[0] if adapter_delta is not None else "",
+            "adapter_delta_y":    adapter_delta[1] if adapter_delta is not None else "",
+            "adapter_delta_z":    adapter_delta[2] if adapter_delta is not None else "",
+            "adapter_delta_norm": adapter_delta_norm,
+            "adapter_error_to_scripted": adapter_error_to_scripted,
             "image_path":        image_path,
         }
         writer.writerow(row)
