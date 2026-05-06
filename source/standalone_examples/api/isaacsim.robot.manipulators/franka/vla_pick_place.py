@@ -37,6 +37,17 @@ parser.add_argument(
     default="damped-least-squares",
 )
 parser.add_argument("--runs", type=int, default=3, help="Number of scripted runs to collect calibration data from")
+parser.add_argument("--seed", type=int, default=None, help="Seed for randomized cube/target sampling")
+parser.add_argument("--cube-x-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+parser.add_argument("--cube-y-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+parser.add_argument("--target-x-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+parser.add_argument("--target-y-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+parser.add_argument(
+    "--min-cube-target-distance",
+    type=float,
+    default=None,
+    help="Minimum XY distance between randomized cube and target positions",
+)
 args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
@@ -70,6 +81,12 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH   = LOG_DIR / "calibration.csv"
 IMAGE_DIR  = LOG_DIR / "images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_CUBE_X_RANGE = (0.40, 0.60)
+DEFAULT_CUBE_Y_RANGE = (-0.18, 0.18)
+DEFAULT_TARGET_X_RANGE = (-0.42, -0.20)
+DEFAULT_TARGET_Y_RANGE = (-0.42, -0.18)
+DEFAULT_MIN_CUBE_TARGET_DISTANCE = 0.35
 
 CSV_FIELDS = [
     "run_id", "phase", "phase_step", "global_step",
@@ -108,6 +125,76 @@ def setup_camera():
     except Exception as e:
         print(f"Camera init warning (may resolve after first frame): {e}")
     return cam
+
+
+# ── Scene randomization ──────────────────────────────────────────────────────
+def env_float_pair(name: str, default: tuple[float, float]) -> tuple[float, float]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    parts = [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"{name} must contain exactly two float values")
+    return validate_range(name, (float(parts[0]), float(parts[1])))
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    return default if raw is None or raw == "" else float(raw)
+
+
+def validate_range(name: str, values: tuple[float, float]) -> tuple[float, float]:
+    low, high = values
+    if not np.isfinite(low) or not np.isfinite(high):
+        raise ValueError(f"{name} values must be finite")
+    if low > high:
+        raise ValueError(f"{name} min must be <= max")
+    return low, high
+
+
+def configured_range(arg_value, env_name: str, default: tuple[float, float]) -> tuple[float, float]:
+    if arg_value is not None:
+        return validate_range(env_name, (float(arg_value[0]), float(arg_value[1])))
+    return env_float_pair(env_name, default)
+
+
+def configured_seed() -> int | None:
+    if args.seed is not None:
+        return args.seed
+    raw = os.environ.get("OPENVLA_RANDOM_SEED")
+    return None if raw is None or raw == "" else int(raw)
+
+
+def sample_xy(rng: np.random.Generator, x_range: tuple[float, float], y_range: tuple[float, float]) -> np.ndarray:
+    return np.array(
+        [
+            rng.uniform(x_range[0], x_range[1]),
+            rng.uniform(y_range[0], y_range[1]),
+        ],
+        dtype=np.float32,
+    )
+
+
+def sample_scene_positions(
+    rng: np.random.Generator,
+    cube_x_range: tuple[float, float],
+    cube_y_range: tuple[float, float],
+    target_x_range: tuple[float, float],
+    target_y_range: tuple[float, float],
+    min_distance: float,
+    target_z: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    for _ in range(100):
+        cube_xy = sample_xy(rng, cube_x_range, cube_y_range)
+        target_xy = sample_xy(rng, target_x_range, target_y_range)
+        if np.linalg.norm(cube_xy - target_xy) >= min_distance:
+            cube_position = np.array([cube_xy[0], cube_xy[1], 0.0258], dtype=np.float32)
+            target_position = np.array([target_xy[0], target_xy[1], target_z], dtype=np.float32)
+            return cube_position, target_position
+    raise RuntimeError(
+        "Could not sample cube/target positions with the configured minimum distance; "
+        "widen the ranges or reduce OPENVLA_MIN_CUBE_TARGET_DISTANCE."
+    )
 
 
 # ── VLA query ─────────────────────────────────────────────────────────────────
@@ -175,11 +262,29 @@ def get_scripted_goal(pick_place: FrankaPickPlace) -> np.ndarray:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    seed = configured_seed()
+    rng = np.random.default_rng(seed)
+    cube_x_range = configured_range(args.cube_x_range, "OPENVLA_CUBE_X_RANGE", DEFAULT_CUBE_X_RANGE)
+    cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
+    target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
+    target_y_range = configured_range(args.target_y_range, "OPENVLA_TARGET_Y_RANGE", DEFAULT_TARGET_Y_RANGE)
+    min_distance = (
+        args.min_cube_target_distance
+        if args.min_cube_target_distance is not None
+        else env_float("OPENVLA_MIN_CUBE_TARGET_DISTANCE", DEFAULT_MIN_CUBE_TARGET_DISTANCE)
+    )
+    if min_distance < 0:
+        raise ValueError("Minimum cube-target distance must be non-negative")
+
     print(f"VLA Calibration Experiment")
     print(f"  Runs:        {args.runs}")
     print(f"  VLA server:  {VLA_SERVER_URL}")
     print(f"  Query every: {VLA_QUERY_EVERY} steps")
     print(f"  Log dir:     {LOG_DIR}")
+    print(f"  Random seed: {seed if seed is not None else 'system entropy'}")
+    print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
+    print(f"  Target x/y:  {target_x_range} / {target_y_range}")
+    print(f"  Min distance:{min_distance}")
 
     SimulationManager.set_physics_sim_device(args.device)
     simulation_app.update()
@@ -196,7 +301,8 @@ def main():
     csv_file, writer = open_csv()
 
     global_step   = 0
-    run_id        = int(time.time())
+    session_id    = str(int(time.time() * 1000))
+    run_id        = f"{session_id}_run000"
     current_run   = 0
     reset_needed  = True
 
@@ -209,10 +315,28 @@ def main():
 
         # ── Reset ────────────────────────────────────────────────────────────
         if reset_needed:
-            pick_place.reset()
+            cube_position, target_position = sample_scene_positions(
+                rng,
+                cube_x_range,
+                cube_y_range,
+                target_x_range,
+                target_y_range,
+                min_distance,
+                float(pick_place.target_position[2]),
+            )
+            pick_place.target_position = target_position
+            pick_place.reset(cube_position=cube_position)
+            simulation_app.update()
+            try:
+                cube_readback = as_vec3(pick_place.cube.get_world_poses()[0].numpy()[0])
+            except Exception:
+                cube_readback = np.zeros(3, dtype=np.float32)
             reset_needed = False
-            run_id = int(time.time())
+            run_id = f"{session_id}_run{current_run + 1:03d}"
             print(f"\n[Run {current_run + 1}/{args.runs}] id={run_id}")
+            print(f"  sampled cube:   {np.round(cube_position, 4)}")
+            print(f"  readback cube:  {np.round(cube_readback, 4)}")
+            print(f"  sampled target: {np.round(target_position, 4)}")
 
         # ── Record state BEFORE scripted step ────────────────────────────────
         phase      = pick_place._event
