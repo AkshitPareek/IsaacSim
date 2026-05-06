@@ -410,6 +410,65 @@ Round 8 collection acceptance gates:
 - Fail: any live-control path is enabled, Phase 4 is included as a candidate, target labels are imbalanced, VLA/adapter fields are sparse, scripted placement quality regresses, or Phase 1 produces repeated large deltas/errors.
 - Safety rule: failure keeps the project in observer-only scripted control; success only permits a later lead-reviewed discussion, not live control.
 
+## Swarm Round 9 Task List
+
+Milestone: complete a strict 15-run Phase 1 adapter dry-run validation with final placement gates before any live-control proposal.
+
+Current safety decision:
+
+- No live VLA or adapter control is approved in Round 9.
+- Scripted Franka control remains the only motion authority for all phases.
+- Phase 1 is the only adapter candidate under review, and only in dry-run logging mode.
+- Phase 0 remains scripted. Phase 4 affine remains rejected and must not be included as a candidate.
+- Generated dry-run logs stay out of commits unless explicitly requested.
+
+Implementer tasks:
+
+- Implementer S: collect the Round 9 15-run Phase 1 dry-run dataset.
+  - Acceptance criteria: use scripted control only; real OpenVLA responses when available; fresh log directory; exactly `15` completed runs unless simulator failure is documented; balanced target labels with `5` runs each for red/green/blue; Phase 1 adapter fields populated; no generated logs committed.
+- Implementer T: run baseline dataset gates with strict final placement checks.
+  - Acceptance criteria: required phases and label balance pass; VLA success coverage is adequate; latency and empty-camera gates pass; every completed run has final cube-to-target XY distance at or below `0.08 m`; fail the round if any run exceeds the final placement gate.
+- Implementer U: run Phase 1 adapter dry-run gates.
+  - Acceptance criteria: phase `1` only; enough accepted samples across all labels; finite adapter numeric fields; high accepted rate; bounded delta norm p95/max; bounded error-to-scripted p95/max; worst rows are reported with run/step/label; command fails if phases `0` or `4` are accidentally treated as candidates.
+- Implementer V: prepare the Round 9 lead decision note.
+  - Acceptance criteria: summarize collection command, dataset gates, final placement gate results, Phase 1 adapter gates, target-label stability, rejection reasons, worst rows, and recommendation: `continue dry-run`, `tighten and recollect`, or `open separate live-control review`.
+
+Round 9 strict gates:
+
+- `15 / 15` scripted runs must complete, or the simulator failure must be documented with partial logs and no promotion decision.
+- Target labels must be balanced at `5` runs each for red, green, and blue.
+- Final placement quality is mandatory: every completed run must end within `0.08 m` XY cube-to-target distance. One miss blocks promotion.
+- Phase 1 adapter proposals must stay bounded, finite, and locally plausible with no repeated large outliers.
+- Phase 4 must remain blocked regardless of Phase 1 results.
+- Passing Round 9 permits only a separate lead-reviewed live-control discussion; it does not enable live control.
+
+## Swarm Round 10 Task List
+
+Milestone: make Round 9/10 collection safer by ensuring only Phase 1 adapter dry-run is considered or logged as a candidate while scripted control remains sole authority.
+
+Current safety decision:
+
+- No live VLA or adapter control is approved in Round 10.
+- Scripted Franka control remains the only motion authority for every phase.
+- Only Phase 1 adapter dry-run rows may be labeled, counted, or summarized as candidate evidence.
+- Phase 0 stays scripted, and Phase 4 affine remains blocked for candidate status.
+- Phase 4 `ready_for_control` metadata in the old affine adapter config is stale offline metadata and must not be promoted into Round 9/10 candidate logs, reports, gates, or decisions.
+
+Implementer tasks:
+
+- Implementer W: audit Round 9/10 collection commands and notes for candidate scoping.
+  - Acceptance criteria: collection remains scripted-control only; adapter dry-run is enabled only for logging; Phase 1 is the sole candidate phase; Phase 0 and Phase 4 are never described as candidate phases.
+- Implementer X: verify analyzer/report commands cannot accidentally promote Phase 4.
+  - Acceptance criteria: gates are run with phase `1` only; any summary or decision note treats Phase 4 as blocked even if old config metadata says ready; candidate counts exclude Phase 4 rows.
+- Implementer Y: prepare a short Round 10 safety note.
+  - Acceptance criteria: note confirms scripted control authority, Phase 1-only dry-run candidate logging, no generated logs committed, and no promotion of old Phase 4 ready metadata.
+
+Round 10 strict gates:
+
+- Pass: Round 9/10 evidence names only Phase 1 dry-run as candidate and clearly separates dry-run proposals from scripted control.
+- Fail: any log/report/decision promotes Phase 4, treats old `ready_for_control` metadata as current approval, or implies VLA/adapter has robot authority.
+- Safety rule: passing Round 10 improves documentation and review hygiene only; it does not enable live control.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:
@@ -422,7 +481,7 @@ Environment:
 
 ```powershell
 cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
-$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_adapter_dryrun_next"
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_adapter_dryrun_round10"
 $env:OPENVLA_SERVER_URL="http://localhost:8000/act"
 $env:OPENVLA_ENABLED="1"
 $env:OPENVLA_QUERY_EVERY="10"
@@ -430,20 +489,22 @@ $env:OPENVLA_TIMEOUT="60"
 $env:OPENVLA_ADAPTER_CONFIG="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_balanced_real\affine_adapter_config.json"
 $env:OPENVLA_ADAPTER_DRY_RUN="1"
 $env:OPENVLA_ADAPTER_MAX_DELTA="0.05"
+$env:OPENVLA_ADAPTER_ENABLED_PHASES="1"
 ```
 
 Command:
 
 ```powershell
-.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 6 --seed 2031 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 2 --instruction-template "pick up the blue cube and place it on the {target_label}" --adapter-dry-run 1 --adapter-max-delta 0.05
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 15 --seed 2039 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 5 --instruction-template "pick up the blue cube and place it on the {target_label}" --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
 ```
 
 Expected outputs:
 
-- `vla_calib_logs_adapter_dryrun_next\calibration.csv`
+- `vla_calib_logs_phase1_adapter_dryrun_round10\calibration.csv`
 - Scripted pick-place phases continue normally in console output.
 - CSV includes VLA success/action/latency fields.
-- CSV includes adapter dry-run fields: readiness, acceptance, rejection reason, proposed goal, proposed delta, delta norm, and distance to scripted goal.
+- CSV includes Phase 1 adapter dry-run fields: readiness, acceptance, rejection reason, proposed goal, proposed delta, delta norm, and distance to scripted goal.
+- Phase 4 may still have VLA observations, but adapter candidate fields should be disabled by the Phase 1 allowlist.
 
 Pass/fail interpretation:
 

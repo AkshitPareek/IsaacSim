@@ -30,6 +30,7 @@
 #   Set OPENVLA_ADAPTER_CONFIG env var to an affine adapter JSON for dry-run goal logging
 #   Set OPENVLA_ADAPTER_DRY_RUN env var (default: 1 when adapter config is supplied)
 #   Set OPENVLA_ADAPTER_MAX_DELTA env var (default: 0.08 meters, reject larger dry-run deltas)
+#   Set OPENVLA_ADAPTER_ENABLED_PHASES env var (optional comma-separated phase allowlist)
 #
 #   .\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares
 
@@ -101,6 +102,12 @@ parser.add_argument(
     type=float,
     default=None,
     help="Maximum affine adapter delta norm accepted for dry-run safety logging",
+)
+parser.add_argument(
+    "--adapter-enabled-phases",
+    type=str,
+    default=None,
+    help="Optional comma-separated phase allowlist for adapter dry-run readiness/candidate logging",
 )
 args, _ = parser.parse_known_args()
 
@@ -245,6 +252,29 @@ def configured_adapter_max_delta() -> float:
     if max_delta <= 0:
         raise ValueError("OPENVLA_ADAPTER_MAX_DELTA must be positive")
     return max_delta
+
+
+def parse_adapter_enabled_phases(raw: str | None) -> set[int] | None:
+    if raw is None or raw.strip() == "":
+        return None
+    phases = set()
+    for part in raw.replace(",", " ").split():
+        phase = int(part)
+        if phase < 0:
+            raise ValueError("Adapter enabled phases must be non-negative integers")
+        phases.add(phase)
+    if not phases:
+        raise ValueError("Adapter enabled phases must include at least one phase")
+    return phases
+
+
+def configured_adapter_enabled_phases() -> set[int] | None:
+    raw = (
+        args.adapter_enabled_phases
+        if args.adapter_enabled_phases is not None
+        else os.environ.get("OPENVLA_ADAPTER_ENABLED_PHASES")
+    )
+    return parse_adapter_enabled_phases(raw)
 
 
 def validate_range(name: str, values: tuple[float, float]) -> tuple[float, float]:
@@ -506,6 +536,7 @@ def main():
     adapter_config = load_adapter_config(configured_adapter_config_path())
     adapter_dry_run = configured_flag(args.adapter_dry_run, "OPENVLA_ADAPTER_DRY_RUN", adapter_config is not None)
     adapter_max_delta = configured_adapter_max_delta()
+    adapter_enabled_phases = configured_adapter_enabled_phases()
     cube_x_range = configured_range(args.cube_x_range, "OPENVLA_CUBE_X_RANGE", DEFAULT_CUBE_X_RANGE)
     cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
@@ -543,6 +574,14 @@ def main():
     print(f"  Dry run:     {int(vla_dry_run)}")
     print(f"  Adapter dry: {int(adapter_dry_run)}")
     print(f"  Adapter max delta: {adapter_max_delta:g} m")
+    print(
+        "  Adapter phases: "
+        + (
+            "all ready phases"
+            if adapter_enabled_phases is None
+            else ", ".join(str(phase) for phase in sorted(adapter_enabled_phases))
+        )
+    )
     print(f"  Log dir:     {LOG_DIR}")
     print(f"  Random seed: {seed if seed is not None else 'system entropy'}")
     print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
@@ -690,8 +729,14 @@ def main():
         if adapter_dry_run and adapter_config is not None and vla_action is not None:
             phase_config = adapter_phase_config(adapter_config, phase)
             if phase_config is not None:
-                adapter_ready = int(bool(phase_config.get("ready_for_control", False)))
-                adapter_delta = compute_adapter_delta(phase_config, vla_action)
+                phase_enabled = adapter_enabled_phases is None or phase in adapter_enabled_phases
+                adapter_ready = int(phase_enabled and bool(phase_config.get("ready_for_control", False)))
+                if not phase_enabled:
+                    adapter_rejected_reason = "phase disabled by adapter phase allowlist"
+                elif not adapter_ready:
+                    adapter_rejected_reason = "phase not ready for control"
+                else:
+                    adapter_delta = compute_adapter_delta(phase_config, vla_action)
                 if adapter_delta is not None:
                     adapter_delta_norm = float(np.linalg.norm(adapter_delta))
                     adapter_goal = ee_pos + adapter_delta
