@@ -122,6 +122,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum rows whose VLA error reports an empty camera frame.",
     )
+    parser.add_argument(
+        "--final-distance-threshold",
+        type=float,
+        default=0.08,
+        help="Final cube-to-target XY distance threshold for success-like run counts.",
+    )
+    parser.add_argument(
+        "--show-runs",
+        action="store_true",
+        help="Print per-run initial/final cube and target diagnostics.",
+    )
+    parser.add_argument(
+        "--max-runs-shown",
+        type=int,
+        default=20,
+        help="Maximum run summaries to print when --show-runs is set.",
+    )
     return parser.parse_args()
 
 
@@ -157,6 +174,12 @@ def format_number(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:.6g}"
+
+
+def format_xy(value: tuple[float, float] | None) -> str:
+    if value is None:
+        return "(n/a, n/a)"
+    return f"({value[0]:.6g}, {value[1]:.6g})"
 
 
 def mean(values: list[float]) -> float | None:
@@ -200,6 +223,10 @@ def distance_3d(a: tuple[float, float, float], b: tuple[float, float, float]) ->
     return math.sqrt(sum((left - right) ** 2 for left, right in zip(a, b)))
 
 
+def distance_2d(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.sqrt(sum((left - right) ** 2 for left, right in zip(a, b)))
+
+
 def is_missing_image(row: dict[str, str], csv_path: Path) -> bool:
     raw_path = (row.get("image_path") or "").strip()
     if not raw_path:
@@ -228,8 +255,64 @@ def is_vla_success(row: dict[str, str]) -> bool:
     return all(value is not None for value in action) and not has_error
 
 
-def analyze(csv_path: Path) -> dict[str, object]:
+def row_xy(row: dict[str, str], x_field: str, y_field: str) -> tuple[float, float] | None:
+    x_value = to_float(row.get(x_field))
+    y_value = to_float(row.get(y_field))
+    if x_value is None or y_value is None:
+        return None
+    return (x_value, y_value)
+
+
+def build_run_summaries(
+    rows: list[dict[str, str]], final_distance_threshold: float
+) -> list[dict[str, object]]:
+    rows_by_run: dict[str, list[dict[str, str]]] = {}
+    for index, row in enumerate(rows):
+        run_id = (row.get("run_id") or "").strip() or f"row_{index}"
+        rows_by_run.setdefault(run_id, []).append(row)
+
+    summaries: list[dict[str, object]] = []
+    for run_id, run_rows in rows_by_run.items():
+        first_row = run_rows[0]
+        last_row = run_rows[-1]
+        initial_cube_xy = row_xy(first_row, "cube_x", "cube_y")
+        target_xy = row_xy(first_row, "target_x", "target_y")
+        final_cube_xy = row_xy(last_row, "cube_x", "cube_y")
+
+        final_distance = None
+        success_like = False
+        if final_cube_xy is not None and target_xy is not None:
+            final_distance = distance_2d(final_cube_xy, target_xy)
+            success_like = final_distance <= final_distance_threshold
+
+        label = (first_row.get("target_label") or "").strip()
+        if not label:
+            label = "n/a"
+
+        summaries.append(
+            {
+                "run_id": run_id,
+                "target_label": label,
+                "initial_cube_xy": initial_cube_xy,
+                "target_xy": target_xy,
+                "final_cube_xy": final_cube_xy,
+                "final_distance_to_target": final_distance,
+                "success_like": success_like,
+                "row_count": len(run_rows),
+                "query_successes": sum(
+                    1
+                    for row in run_rows
+                    if parse_boolish(row.get("vla_queried")) and is_vla_success(row)
+                ),
+            }
+        )
+
+    return summaries
+
+
+def analyze(csv_path: Path, final_distance_threshold: float) -> dict[str, object]:
     rows = load_rows(csv_path)
+    run_summaries = build_run_summaries(rows, final_distance_threshold)
 
     run_ids = {row.get("run_id", "") for row in rows if row.get("run_id", "") != ""}
     phases = Counter(row.get("phase", "unknown") or "unknown" for row in rows)
@@ -285,6 +368,8 @@ def analyze(csv_path: Path) -> dict[str, object]:
         "csv_path": csv_path,
         "row_count": len(rows),
         "run_count": len(run_ids),
+        "run_summaries": run_summaries,
+        "final_distance_threshold": final_distance_threshold,
         "phases": phases,
         "vla_queried_count": len(queried_rows),
         "vla_success_count": vla_success_count,
@@ -490,7 +575,7 @@ def print_quality_gates(gates: list[dict[str, object]]) -> None:
     print(f"Overall: {overall}")
 
 
-def print_report(report: dict[str, object]) -> None:
+def print_report(report: dict[str, object], show_runs: bool, max_runs_shown: int) -> None:
     phases = report["phases"]
     assert isinstance(phases, Counter)
 
@@ -504,6 +589,8 @@ def print_report(report: dict[str, object]) -> None:
     assert isinstance(target_labels, Counter)
     run_counts_by_label = report["run_counts_by_label"]
     assert isinstance(run_counts_by_label, Counter)
+    run_summaries = report["run_summaries"]
+    assert isinstance(run_summaries, list)
 
     phase_report = ", ".join(f"{phase}={count}" for phase, count in sorted(phases.items()))
     if not phase_report:
@@ -550,6 +637,58 @@ def print_report(report: dict[str, object]) -> None:
     print(f"Target Y: {format_range(report['target_y'])}")
     print(f"Missing images: {report['missing_images']}")
     print()
+    print("Run-Level Coverage")
+    initial_cube_x = [
+        summary["initial_cube_xy"][0]
+        for summary in run_summaries
+        if summary.get("initial_cube_xy") is not None
+    ]
+    initial_cube_y = [
+        summary["initial_cube_xy"][1]
+        for summary in run_summaries
+        if summary.get("initial_cube_xy") is not None
+    ]
+    run_target_x = [
+        summary["target_xy"][0]
+        for summary in run_summaries
+        if summary.get("target_xy") is not None
+    ]
+    run_target_y = [
+        summary["target_xy"][1]
+        for summary in run_summaries
+        if summary.get("target_xy") is not None
+    ]
+    final_distances = [
+        summary["final_distance_to_target"]
+        for summary in run_summaries
+        if summary.get("final_distance_to_target") is not None
+    ]
+    success_like_count = sum(1 for summary in run_summaries if summary.get("success_like"))
+    print(f"Initial cube X: {format_range(initial_cube_x)}")
+    print(f"Initial cube Y: {format_range(initial_cube_y)}")
+    print(f"Target X: {format_range(run_target_x)}")
+    print(f"Target Y: {format_range(run_target_y)}")
+    print(f"Final distance threshold: {format_number(report['final_distance_threshold'])}")
+    print(f"Success-like runs: {success_like_count} / {len(run_summaries)}")
+    print(f"Final distance mean: {format_number(mean(final_distances))}")
+    print(f"Final distance max: {format_number(max(final_distances) if final_distances else None)}")
+    if show_runs:
+        print()
+        print("Run Summary")
+        shown_count = max(0, max_runs_shown)
+        for summary in run_summaries[:shown_count]:
+            print(
+                f"{summary['run_id']} label={summary['target_label']} "
+                f"initial_cube={format_xy(summary['initial_cube_xy'])} "
+                f"target={format_xy(summary['target_xy'])} "
+                f"final_cube={format_xy(summary['final_cube_xy'])} "
+                f"final_distance_to_target={format_number(summary['final_distance_to_target'])} "
+                f"rows={summary['row_count']} "
+                f"query_successes={summary['query_successes']}"
+            )
+        if len(run_summaries) > shown_count:
+            print(f"... {len(run_summaries) - shown_count} more runs not shown")
+    print()
     print("EE Goal Delta")
     print(f"Samples: {len(ee_goal_distances)}")
     print(f"Mean: {format_number(mean(ee_goal_distances))}")
@@ -564,8 +703,8 @@ def main() -> int:
         print(f"CSV not found: {csv_path}")
         return 1
 
-    report = analyze(csv_path)
-    print_report(report)
+    report = analyze(csv_path, args.final_distance_threshold)
+    print_report(report, args.show_runs, args.max_runs_shown)
     gates = evaluate_gates(args, report)
     print_quality_gates(gates)
     if gates and not all(bool(gate["passed"]) for gate in gates):
