@@ -304,6 +304,33 @@ Verification on `vla_calib_logs_adapter_dryrun_test2/calibration.csv`:
 - Gate command with `--required-phases 1,4 --min-adapter-samples-per-phase 1 --max-adapter-delta-max 0.08 --max-adapter-error-max 0.1` failed as expected.
 - Conclusion remains unchanged: no affine adapter live control; collect a larger scripted dry-run dataset and gate it with this analyzer.
 
+Fresh scripted adapter dry-run collection:
+
+- Dataset: `vla_calib_logs_adapter_dryrun_next/calibration.csv`
+- Command used the D3D12 Isaac Python launcher, scripted Franka control, real OpenVLA HTTP, adapter dry-run enabled, and `OPENVLA_ADAPTER_MAX_DELTA=0.05`.
+- Runs: `6`, rows: `1680`, target labels balanced at `2` runs each for red/green/blue.
+- VLA queries: `168`, successes: `167`, errors: `1` first-frame empty camera frame.
+- VLA latency p95: `2585.94 ms`.
+- Query successes by phase: phase `0=35`, `1=24`, `4=48`.
+- Dataset quality gates passed for required phases, label balance, empty camera frames, and latency.
+- Scripted run-level success-like count was `5 / 6`; run `004` missed final target distance with `0.528938 m`, so future collection gates should also require scripted final placement quality.
+
+Adapter dry-run result on the fresh collection:
+
+- Phase 1:
+  - samples: `24`
+  - accepted: `22 / 24`
+  - delta norm max: `0.0505235 m`
+  - error-to-scripted max: `0.0600677 m`
+  - looks plausible but still needs more data and a slightly consistent threshold policy.
+- Phase 4:
+  - samples: `48`
+  - accepted: `0 / 48`
+  - delta norm p95/max: `0.570568 / 0.586031 m`
+  - error-to-scripted p95/max: `0.603796 / 0.702003 m`
+  - failed gates with `--max-adapter-delta-max 0.08 --max-adapter-error-max 0.1`.
+- Conclusion is stronger now: the affine adapter must not control Phase 4. Phase 1 is the only current candidate for further dry-run investigation, and Phase 0 remains scripted.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:
