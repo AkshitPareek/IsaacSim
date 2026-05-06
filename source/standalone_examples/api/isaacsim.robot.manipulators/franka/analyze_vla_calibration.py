@@ -75,6 +75,53 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum observed OpenVLA latency in milliseconds.",
     )
+    parser.add_argument(
+        "--min-query-successes-total",
+        type=int,
+        default=None,
+        help="Minimum total successful OpenVLA query count.",
+    )
+    parser.add_argument(
+        "--min-query-successes-per-phase",
+        type=int,
+        default=None,
+        help="Minimum successful OpenVLA query count for each required/observed phase.",
+    )
+    parser.add_argument(
+        "--required-phases",
+        default=None,
+        help="Comma-separated phases that must be present and satisfy per-phase gates, e.g. 0,1,4.",
+    )
+    parser.add_argument(
+        "--min-label-count",
+        type=int,
+        default=None,
+        help="Minimum number of distinct non-empty target labels.",
+    )
+    parser.add_argument(
+        "--min-runs-per-label",
+        type=int,
+        default=None,
+        help="Minimum unique runs for each observed target label.",
+    )
+    parser.add_argument(
+        "--max-vla-latency-p95-ms",
+        type=float,
+        default=None,
+        help="Maximum p95 OpenVLA latency in milliseconds.",
+    )
+    parser.add_argument(
+        "--max-vla-latency-max-ms",
+        type=float,
+        default=None,
+        help="Maximum max OpenVLA latency in milliseconds.",
+    )
+    parser.add_argument(
+        "--max-empty-camera-frames",
+        type=int,
+        default=None,
+        help="Maximum rows whose VLA error reports an empty camera frame.",
+    )
     return parser.parse_args()
 
 
@@ -118,6 +165,20 @@ def mean(values: list[float]) -> float | None:
     return sum(values) / len(values)
 
 
+def percentile(values: list[float], percent: float) -> float | None:
+    if not values:
+        return None
+    if percent <= 0:
+        return min(values)
+    if percent >= 100:
+        return max(values)
+
+    ordered = sorted(values)
+    rank = math.ceil((percent / 100.0) * len(ordered))
+    index = max(0, min(rank - 1, len(ordered) - 1))
+    return ordered[index]
+
+
 def span(values: list[float]) -> float | None:
     if not values:
         return None
@@ -155,6 +216,18 @@ def load_rows(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
+def parse_csv_values(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    return [value.strip() for value in raw_value.split(",") if value.strip()]
+
+
+def is_vla_success(row: dict[str, str]) -> bool:
+    action = [to_float(row.get(field)) for field in VLA_ACTION_FIELDS]
+    has_error = bool((row.get("vla_error") or "").strip())
+    return all(value is not None for value in action) and not has_error
+
+
 def analyze(csv_path: Path) -> dict[str, object]:
     rows = load_rows(csv_path)
 
@@ -163,16 +236,35 @@ def analyze(csv_path: Path) -> dict[str, object]:
 
     queried_rows = [row for row in rows if parse_boolish(row.get("vla_queried"))]
     vla_error_count = sum(1 for row in queried_rows if (row.get("vla_error") or "").strip())
+    empty_camera_frames = sum(
+        1
+        for row in rows
+        if "empty camera frame" in (row.get("vla_error") or "").strip().lower()
+    )
 
     vla_success_count = 0
     vla_incomplete_count = 0
+    query_successes_by_phase: Counter[str] = Counter()
     for row in queried_rows:
-        action = [to_float(row.get(field)) for field in VLA_ACTION_FIELDS]
         has_error = bool((row.get("vla_error") or "").strip())
-        if all(value is not None for value in action) and not has_error:
+        if is_vla_success(row):
             vla_success_count += 1
+            query_successes_by_phase[row.get("phase", "unknown") or "unknown"] += 1
         elif not has_error:
             vla_incomplete_count += 1
+
+    target_labels = Counter(
+        (row.get("target_label") or "").strip()
+        for row in rows
+        if (row.get("target_label") or "").strip()
+    )
+    runs_by_label: dict[str, set[str]] = {}
+    for row in rows:
+        label = (row.get("target_label") or "").strip()
+        run_id = (row.get("run_id") or "").strip()
+        if label and run_id:
+            runs_by_label.setdefault(label, set()).add(run_id)
+    run_counts_by_label = Counter({label: len(run_ids) for label, run_ids in runs_by_label.items()})
 
     cube_x = [value for row in rows if (value := to_float(row.get("cube_x"))) is not None]
     cube_y = [value for row in rows if (value := to_float(row.get("cube_y"))) is not None]
@@ -198,6 +290,10 @@ def analyze(csv_path: Path) -> dict[str, object]:
         "vla_success_count": vla_success_count,
         "vla_error_count": vla_error_count,
         "vla_incomplete_count": vla_incomplete_count,
+        "query_successes_by_phase": query_successes_by_phase,
+        "target_labels": target_labels,
+        "run_counts_by_label": run_counts_by_label,
+        "empty_camera_frames": empty_camera_frames,
         "cube_x": cube_x,
         "cube_y": cube_y,
         "target_x": target_x,
@@ -221,8 +317,15 @@ def evaluate_gates(args: argparse.Namespace, report: dict[str, object]) -> list[
     success_count = int(report["vla_success_count"])
     error_count = int(report["vla_error_count"])
     missing_images = int(report["missing_images"])
+    empty_camera_frames = int(report["empty_camera_frames"])
     latencies_ms = report["latencies_ms"]
     assert isinstance(latencies_ms, list)
+    query_successes_by_phase = report["query_successes_by_phase"]
+    assert isinstance(query_successes_by_phase, Counter)
+    target_labels = report["target_labels"]
+    assert isinstance(target_labels, Counter)
+    run_counts_by_label = report["run_counts_by_label"]
+    assert isinstance(run_counts_by_label, Counter)
 
     gates: list[dict[str, object]] = []
 
@@ -287,6 +390,78 @@ def evaluate_gates(args: argparse.Namespace, report: dict[str, object]) -> list[
             actual is not None and actual <= args.max_latency_ms,
         )
 
+    if args.min_query_successes_total is not None:
+        add_gate(
+            "Query successes total",
+            success_count,
+            f">= {args.min_query_successes_total}",
+            success_count >= args.min_query_successes_total,
+        )
+
+    required_phases = parse_csv_values(args.required_phases)
+    for phase in required_phases:
+        actual = query_successes_by_phase.get(phase, 0)
+        add_gate(f"Required phase {phase} query successes", actual, ">= 1", actual >= 1)
+
+    if args.min_query_successes_per_phase is not None:
+        phases_to_check = required_phases or sorted(str(phase) for phase in query_successes_by_phase.keys())
+        if not phases_to_check:
+            add_gate(
+                "Query successes per phase",
+                None,
+                f">= {args.min_query_successes_per_phase}",
+                False,
+            )
+        for phase in phases_to_check:
+            actual = query_successes_by_phase.get(phase, 0)
+            add_gate(
+                f"Phase {phase} query successes",
+                actual,
+                f">= {args.min_query_successes_per_phase}",
+                actual >= args.min_query_successes_per_phase,
+            )
+
+    if args.min_label_count is not None:
+        actual = len(target_labels)
+        add_gate("Target label count", actual, f">= {args.min_label_count}", actual >= args.min_label_count)
+
+    if args.min_runs_per_label is not None:
+        if not run_counts_by_label:
+            add_gate("Runs per target label", None, f">= {args.min_runs_per_label}", False)
+        for label, actual in sorted(run_counts_by_label.items()):
+            add_gate(
+                f"Runs for label '{label}'",
+                actual,
+                f">= {args.min_runs_per_label}",
+                actual >= args.min_runs_per_label,
+            )
+
+    if args.max_vla_latency_p95_ms is not None:
+        actual = percentile(latencies_ms, 95)
+        add_gate(
+            "VLA latency p95 ms",
+            actual,
+            f"<= {args.max_vla_latency_p95_ms:.6g}",
+            actual is not None and actual <= args.max_vla_latency_p95_ms,
+        )
+
+    if args.max_vla_latency_max_ms is not None:
+        actual = max(latencies_ms) if latencies_ms else None
+        add_gate(
+            "VLA latency max ms",
+            actual,
+            f"<= {args.max_vla_latency_max_ms:.6g}",
+            actual is not None and actual <= args.max_vla_latency_max_ms,
+        )
+
+    if args.max_empty_camera_frames is not None:
+        add_gate(
+            "Empty camera frames",
+            empty_camera_frames,
+            f"<= {args.max_empty_camera_frames}",
+            empty_camera_frames <= args.max_empty_camera_frames,
+        )
+
     return gates
 
 
@@ -323,6 +498,12 @@ def print_report(report: dict[str, object]) -> None:
     assert isinstance(ee_goal_distances, list)
     latencies_ms = report["latencies_ms"]
     assert isinstance(latencies_ms, list)
+    query_successes_by_phase = report["query_successes_by_phase"]
+    assert isinstance(query_successes_by_phase, Counter)
+    target_labels = report["target_labels"]
+    assert isinstance(target_labels, Counter)
+    run_counts_by_label = report["run_counts_by_label"]
+    assert isinstance(run_counts_by_label, Counter)
 
     phase_report = ", ".join(f"{phase}={count}" for phase, count in sorted(phases.items()))
     if not phase_report:
@@ -341,7 +522,26 @@ def print_report(report: dict[str, object]) -> None:
     print(f"Incomplete actions: {report['vla_incomplete_count']}")
     print(f"Latency samples: {len(latencies_ms)}")
     print(f"Latency mean ms: {format_number(mean(latencies_ms))}")
+    print(f"Latency p50 ms: {format_number(percentile(latencies_ms, 50))}")
+    print(f"Latency p90 ms: {format_number(percentile(latencies_ms, 90))}")
+    print(f"Latency p95 ms: {format_number(percentile(latencies_ms, 95))}")
     print(f"Latency max ms: {format_number(max(latencies_ms) if latencies_ms else None)}")
+    print(f"Empty camera frames: {report['empty_camera_frames']}")
+    print()
+    print("Query Successes By Phase")
+    if query_successes_by_phase:
+        for phase, count in sorted(query_successes_by_phase.items()):
+            print(f"phase {phase}: {count}")
+    else:
+        print("n/a")
+    print()
+    print("Target Labels")
+    if target_labels:
+        for label, row_count in sorted(target_labels.items()):
+            run_count = run_counts_by_label.get(label, 0)
+            print(f"{label}: {run_count} runs, {row_count} rows")
+    else:
+        print("n/a")
     print()
     print("Scene Coverage")
     print(f"Cube X: {format_range(report['cube_x'])}")
