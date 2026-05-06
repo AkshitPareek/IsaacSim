@@ -19,6 +19,8 @@
 #   Set OPENVLA_SERVER_URL env var (default: http://localhost:8000/act)
 #   Set OPENVLA_LOG_DIR env var (default: ./vla_calib_logs)
 #   Set OPENVLA_TARGET_LABELS env var (default: target)
+#   Set OPENVLA_TARGET_LABEL_MODE env var (default: random; random, cycle, balanced)
+#   Set OPENVLA_RUNS_PER_LABEL env var (balanced mode only)
 #   Set OPENVLA_INSTRUCTION_TEMPLATE env var (default: pick up the blue cube and place it on the {target_label})
 #   Set OPENVLA_QUERY_EVERY env var (default: 10, query VLA every N steps)
 #   Set OPENVLA_ENABLED env var (default: 1)
@@ -52,6 +54,19 @@ parser.add_argument("--openvla-timeout", type=float, default=None, help="OpenVLA
 parser.add_argument("--openvla-save-images", type=int, choices=[0, 1], default=None, help="Save calibration camera frames")
 parser.add_argument("--openvla-dry-run", type=int, choices=[0, 1], default=None, help="Log state/images but skip OpenVLA HTTP")
 parser.add_argument("--target-labels", type=str, default=None, help="Comma-separated language labels to sample per run")
+parser.add_argument(
+    "--target-label-mode",
+    type=str,
+    choices=["random", "cycle", "balanced"],
+    default=None,
+    help="How to assign target labels across runs; default is random",
+)
+parser.add_argument(
+    "--runs-per-label",
+    type=int,
+    default=None,
+    help="For balanced mode, collect this many runs for each target label",
+)
 parser.add_argument(
     "--instruction-template",
     type=str,
@@ -104,6 +119,8 @@ DEFAULT_TARGET_Y_RANGE = (-0.42, -0.18)
 DEFAULT_MIN_CUBE_TARGET_DISTANCE = 0.35
 DEFAULT_TARGET_LABELS = ("target",)
 DEFAULT_INSTRUCTION_TEMPLATE = "pick up the blue cube and place it on the {target_label}"
+DEFAULT_TARGET_LABEL_MODE = "random"
+DEFAULT_SCRIPTED_STEPS_PER_RUN = 280
 
 CSV_FIELDS = [
     "run_id", "phase", "phase_step", "global_step",
@@ -218,6 +235,24 @@ def configured_target_labels() -> tuple[str, ...]:
     return parse_labels(raw, DEFAULT_TARGET_LABELS)
 
 
+def configured_target_label_mode() -> str:
+    mode = args.target_label_mode or os.environ.get("OPENVLA_TARGET_LABEL_MODE", DEFAULT_TARGET_LABEL_MODE)
+    if mode not in {"random", "cycle", "balanced"}:
+        raise ValueError("Target label mode must be one of: random, cycle, balanced")
+    return mode
+
+
+def configured_runs_per_label() -> int | None:
+    if args.runs_per_label is not None:
+        value = args.runs_per_label
+    else:
+        raw = os.environ.get("OPENVLA_RUNS_PER_LABEL")
+        value = None if raw is None or raw == "" else int(raw)
+    if value is not None and value <= 0:
+        raise ValueError("Runs per label must be positive")
+    return value
+
+
 def configured_instruction_template() -> str:
     if args.instruction_template is not None:
         template = args.instruction_template
@@ -240,6 +275,27 @@ def build_instruction(template: str, target_label: str) -> str:
 
 def sample_target_label(rng: np.random.Generator, labels: tuple[str, ...]) -> str:
     return str(rng.choice(labels))
+
+
+def build_target_label_plan(
+    labels: tuple[str, ...],
+    mode: str,
+    runs: int,
+    runs_per_label: int | None,
+) -> tuple[str | None, ...]:
+    if runs <= 0:
+        raise ValueError("Number of runs must be positive")
+    if mode == "random":
+        return tuple(None for _ in range(runs))
+
+    if mode == "balanced" and runs_per_label is not None:
+        return tuple(label for label in labels for _ in range(runs_per_label))
+
+    return tuple(labels[i % len(labels)] for i in range(runs))
+
+
+def estimate_vla_samples(total_runs: int) -> int:
+    return int(np.ceil((total_runs * DEFAULT_SCRIPTED_STEPS_PER_RUN) / max(VLA_QUERY_EVERY, 1)))
 
 
 def sample_xy(rng: np.random.Generator, x_range: tuple[float, float], y_range: tuple[float, float]) -> np.ndarray:
@@ -358,6 +414,10 @@ def main():
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
     target_y_range = configured_range(args.target_y_range, "OPENVLA_TARGET_Y_RANGE", DEFAULT_TARGET_Y_RANGE)
     target_labels = configured_target_labels()
+    target_label_mode = configured_target_label_mode()
+    runs_per_label = configured_runs_per_label()
+    target_label_plan = build_target_label_plan(target_labels, target_label_mode, args.runs, runs_per_label)
+    total_runs = len(target_label_plan)
     instruction_template = configured_instruction_template()
     min_distance = (
         args.min_cube_target_distance
@@ -367,11 +427,16 @@ def main():
     if min_distance < 0:
         raise ValueError("Minimum cube-target distance must be non-negative")
 
+    estimated_vla_samples = estimate_vla_samples(total_runs)
+    estimated_http_calls = 0 if (not vla_enabled or vla_dry_run) else estimated_vla_samples
+
     print(f"VLA Calibration Experiment")
-    print(f"  Runs:        {args.runs}")
+    print(f"  Runs:        {total_runs}")
     print(f"  VLA enabled: {int(vla_enabled)}")
     print(f"  VLA server:  {VLA_SERVER_URL}")
     print(f"  Query every: {VLA_QUERY_EVERY} steps")
+    print(f"  Est. samples:{estimated_vla_samples}")
+    print(f"  Est. HTTP:   {estimated_http_calls}")
     print(f"  Timeout:     {vla_timeout:g} seconds")
     print(f"  Save images: {int(vla_save_images)}")
     print(f"  Dry run:     {int(vla_dry_run)}")
@@ -381,7 +446,15 @@ def main():
     print(f"  Target x/y:  {target_x_range} / {target_y_range}")
     print(f"  Min distance:{min_distance}")
     print(f"  Labels:      {', '.join(target_labels)}")
+    print(f"  Label mode:  {target_label_mode}")
+    if runs_per_label is not None:
+        print(f"  Runs/label:  {runs_per_label}")
     print(f"  Template:    {instruction_template}")
+    if target_label_mode != "random":
+        planned_labels = ", ".join(
+            f"run{i + 1:03d}={label}" for i, label in enumerate(target_label_plan)
+        )
+        print(f"  Label plan:  {planned_labels}")
 
     SimulationManager.set_physics_sim_device(args.device)
     simulation_app.update()
@@ -405,7 +478,7 @@ def main():
     current_target_label = ""
     current_instruction = build_instruction(instruction_template, target_labels[0])
 
-    print(f"\nStarting calibration data collection (run 1 of {args.runs})...")
+    print(f"\nStarting calibration data collection (run 1 of {total_runs})...")
 
     while simulation_app.is_running():
         if not SimulationManager.is_simulating():
@@ -426,7 +499,12 @@ def main():
             pick_place.target_position = target_position
             pick_place.reset(cube_position=cube_position)
             simulation_app.update()
-            current_target_label = sample_target_label(rng, target_labels)
+            planned_label = target_label_plan[current_run]
+            current_target_label = (
+                sample_target_label(rng, target_labels)
+                if planned_label is None
+                else planned_label
+            )
             current_instruction = build_instruction(instruction_template, current_target_label)
             try:
                 cube_readback = as_vec3(pick_place.cube.get_world_poses()[0].numpy()[0])
@@ -434,7 +512,7 @@ def main():
                 cube_readback = np.zeros(3, dtype=np.float32)
             reset_needed = False
             run_id = f"{session_id}_run{current_run + 1:03d}"
-            print(f"\n[Run {current_run + 1}/{args.runs}] id={run_id}")
+            print(f"\n[Run {current_run + 1}/{total_runs}] id={run_id}")
             print(f"  sampled cube:   {np.round(cube_position, 4)}")
             print(f"  readback cube:  {np.round(cube_readback, 4)}")
             print(f"  sampled target: {np.round(target_position, 4)}")
@@ -542,8 +620,8 @@ def main():
         if pick_place.is_done():
             current_run += 1
             print(f"Run {current_run} complete.")
-            if current_run >= args.runs:
-                print(f"\nAll {args.runs} calibration runs complete.")
+            if current_run >= total_runs:
+                print(f"\nAll {total_runs} calibration runs complete.")
                 print(f"CSV saved to: {CSV_PATH}")
                 print(f"Images saved to: {IMAGE_DIR}")
                 break
