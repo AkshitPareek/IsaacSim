@@ -51,3 +51,50 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 - Dataset report can parse existing `vla_calib_logs/calibration.csv`.
 - Logs clearly distinguish successful VLA rows, skipped rows, and error rows.
 
+## Completed Swarm Round 1
+
+Merged branches:
+
+- `codex/openvla-baseline-checkpoint`
+- `codex/openvla-dataset-report`
+- `codex/openvla-randomized-scenes`
+- `codex/openvla-query-diagnostics`
+
+New or updated capabilities:
+
+- `vla_pick_place.py` can randomize cube and target positions per scripted observer run.
+- `vla_pick_place.py` has VLA diagnostics and controls:
+  - `--openvla-enabled` / `OPENVLA_ENABLED`
+  - `--openvla-timeout` / `OPENVLA_TIMEOUT`
+  - `--openvla-save-images` / `OPENVLA_SAVE_IMAGES`
+  - `--openvla-dry-run` / `OPENVLA_DRY_RUN`
+  - `vla_latency_ms` CSV column
+  - 7D VLA action validation
+- `analyze_vla_calibration.py` summarizes calibration CSVs without Isaac imports.
+- Scripted Franka control remains unchanged; VLA is still observer/logging only.
+
+Useful commands:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_next"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 3 --seed 123 --openvla-dry-run 1
+```
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_calibration.py --csv vla_calib_logs_next\calibration.csv
+```
+
+Test evidence from implementers:
+
+- Dataset analyzer parsed existing `vla_calib_logs/calibration.csv`: 280 rows, 1 run, 13 VLA successes, 1 VLA error.
+- Randomized observer completed 2 D3D12 scripted runs with distinct cube and target XY positions.
+- Diagnostics observer completed disabled-VLA, dry-run, and malformed-action tests without breaking scripted simulation.
+
+Current next step:
+
+- Collect a larger randomized observer dataset using fresh log directories.
+- Use the analyzer to verify coverage, VLA success rate, image capture, and end-effector goal deltas.
+- Only after dataset quality is good, start building an action adapter in dry-run mode.
+
