@@ -65,7 +65,7 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 
 ## Swarm Round 2 Task Split
 
-- [ ] Lead: turn the next milestone into concrete branch tasks and review implementer plans.
+- [x] Lead: turn the next milestone into concrete branch tasks and review implementer plans.
 - [x] Implementer D: add dataset quality gates/report thresholds to the analyzer.
 - [x] Implementer E: add target variants, labels, and language templates in observer mode.
 - [x] Implementer F: design and implement an offline dry-run action adapter report without robot control.
@@ -96,6 +96,55 @@ Current next step:
 - Generate a larger randomized observer dataset with real OpenVLA responses.
 - Run quality gates and the adapter report on that fresh dataset.
 - Use the resulting evidence to decide whether Phase 0 model control is ready for a guarded live experiment.
+
+## Completed Swarm Round 3
+
+Merged branches:
+
+- `codex/openvla-balanced-collection`
+- `codex/openvla-phase-quality-gates`
+- `codex/openvla-adapter-diagnostics`
+- `codex/openvla-run-summary`
+
+New or updated capabilities:
+
+- `vla_pick_place.py` can cycle or balance target labels across runs:
+  - `--target-label-mode random|cycle|balanced`
+  - `--runs-per-label`
+- `analyze_vla_calibration.py` reports query successes by phase, target label distribution, latency percentiles, empty camera frames, and run-level coverage.
+- `analyze_vla_calibration.py` can gate required phase sample counts and label diversity.
+- `report_vla_action_adapter.py` reports per-phase adapter behavior, axis sign agreement, simple correlations, and grid-search scale diagnostics.
+
+Real-small dataset summary:
+
+- Dataset: `vla_calib_logs_real_small/calibration.csv`
+- Runs: `2`
+- Rows: `560`
+- VLA success: `27 / 28`
+- Mean latency: `3505.11 ms`
+- Labels sampled: only `green target`
+- Query successes by phase: phase `0=5`, `1=4`, `4=8`
+- Run-level placement success-like count: `2 / 2` under `0.08 m` XY final distance.
+- Adapter report marks phases `0`, `1`, and `4` as `LOW SAMPLE`.
+- Phase 0 shows `x` sign disagreement in this tiny dataset, so live model control is not ready.
+
+Recommended next real collection:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_balanced_real"
+$env:OPENVLA_SERVER_URL="http://localhost:8000/act"
+$env:OPENVLA_QUERY_EVERY="10"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 15 --seed 2027 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 5 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-timeout 60
+```
+
+Recommended validation:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_calibration.py --csv vla_calib_logs_balanced_real\calibration.csv --required-phases 0,1,4 --min-query-successes-per-phase 20 --min-label-count 3 --min-runs-per-label 5 --max-empty-camera-frames 2 --max-vla-latency-p95-ms 10000
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\report_vla_action_adapter.py --csv vla_calib_logs_balanced_real\calibration.csv --per-phase --diagnose-axes --grid-search-scales 0.05,0.1,0.25,0.5,1.0
+```
 
 ## Verification Targets
 
