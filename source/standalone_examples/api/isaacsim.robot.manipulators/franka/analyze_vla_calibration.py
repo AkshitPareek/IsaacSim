@@ -129,6 +129,24 @@ def parse_args() -> argparse.Namespace:
         help="Final cube-to-target XY distance threshold for success-like run counts.",
     )
     parser.add_argument(
+        "--min-success-like-runs",
+        type=int,
+        default=None,
+        help="Minimum runs whose final cube-to-target XY distance is within --final-distance-threshold.",
+    )
+    parser.add_argument(
+        "--min-final-success-rate",
+        type=float,
+        default=None,
+        help="Minimum fraction of runs within --final-distance-threshold at final placement.",
+    )
+    parser.add_argument(
+        "--max-final-distance",
+        type=float,
+        default=None,
+        help="Maximum allowed final cube-to-target XY distance across runs.",
+    )
+    parser.add_argument(
         "--show-runs",
         action="store_true",
         help="Print per-run initial/final cube and target diagnostics.",
@@ -411,6 +429,8 @@ def evaluate_gates(args: argparse.Namespace, report: dict[str, object]) -> list[
     assert isinstance(target_labels, Counter)
     run_counts_by_label = report["run_counts_by_label"]
     assert isinstance(run_counts_by_label, Counter)
+    run_summaries = report["run_summaries"]
+    assert isinstance(run_summaries, list)
 
     gates: list[dict[str, object]] = []
 
@@ -545,6 +565,39 @@ def evaluate_gates(args: argparse.Namespace, report: dict[str, object]) -> list[
             empty_camera_frames,
             f"<= {args.max_empty_camera_frames}",
             empty_camera_frames <= args.max_empty_camera_frames,
+        )
+
+    success_like_runs = sum(1 for summary in run_summaries if summary.get("success_like"))
+    final_distances = [
+        summary["final_distance_to_target"]
+        for summary in run_summaries
+        if summary.get("final_distance_to_target") is not None
+    ]
+
+    if args.min_success_like_runs is not None:
+        add_gate(
+            "Success-like runs",
+            success_like_runs,
+            f">= {args.min_success_like_runs}",
+            success_like_runs >= args.min_success_like_runs,
+        )
+
+    if args.min_final_success_rate is not None:
+        actual = rate(success_like_runs, len(run_summaries))
+        add_gate(
+            "Final success rate",
+            actual,
+            f">= {args.min_final_success_rate:.6g}",
+            actual is not None and actual >= args.min_final_success_rate,
+        )
+
+    if args.max_final_distance is not None:
+        actual = max(final_distances) if final_distances else None
+        add_gate(
+            "Final distance max",
+            actual,
+            f"<= {args.max_final_distance:.6g}",
+            actual is not None and actual <= args.max_final_distance,
         )
 
     return gates

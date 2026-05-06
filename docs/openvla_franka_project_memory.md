@@ -382,6 +382,34 @@ Round 7 data diagnosis:
   - Phase 4 VLA success was `48 / 48`
 - Recommendation: do not extend this affine adapter to Phase 4. Use Phase 1 only as a dry-run scaffold/milestone. The next real autonomy direction should be an object-local adapter that conditions on EE, cube, target, and phase semantics, and outputs bounded local servo steps rather than one-shot global transport deltas.
 
+## Swarm Round 8 Task List
+
+Milestone: validate a larger Phase 1-only scripted dry-run dataset before any live-control discussion.
+
+Current safety decision:
+
+- No live VLA or affine adapter control is approved in Round 8.
+- Scripted Franka control remains the only motion authority.
+- Round 8 scope is Phase 1 dry-run evidence only; Phase 0 stays scripted and Phase 4 is not a candidate.
+- Phase 4 affine remains rejected due to repeated transport-sized deltas, high error-to-scripted goals, and zero accepted samples in the fresh dry-run evidence.
+
+Implementer tasks:
+
+- Implementer O: collect a larger Phase 1-only adapter dry-run dataset with real OpenVLA responses when available.
+  - Acceptance criteria: scripted control only; Phase 1 adapter logging enabled; fresh log directory; balanced target labels; at least `15` completed runs or a documented simulator failure with partial logs; generated logs are not committed unless explicitly requested.
+- Implementer P: run dataset quality and Phase 1 adapter gates on the new collection.
+  - Acceptance criteria: required Phase 1 sample count passes; VLA success coverage, latency, empty-camera, target-balance, scripted placement, finite numeric fields, acceptance rate, delta-norm p95/max, error-to-scripted p95/max, and worst-row checks are reported.
+- Implementer Q: compare the larger Phase 1-only dry-run evidence against Round 7 results.
+  - Acceptance criteria: report shows accepted/rejected counts, rejection reasons, percentiles, worst rows, and whether Phase 1 behavior is stable across target labels and runs.
+- Implementer R: prepare a lead decision note.
+  - Acceptance criteria: recommendation is one of `continue Phase 1 dry-run`, `tighten gates and recollect`, or `redesign adapter`; it must not request live control unless a separate future review is explicitly opened after Round 8 evidence is accepted.
+
+Round 8 collection acceptance gates:
+
+- Pass: Phase 1-only dry-run collection is balanced, reproducible, finite, low-latency enough for logging, and shows stable bounded local proposals with no large outliers.
+- Fail: any live-control path is enabled, Phase 4 is included as a candidate, target labels are imbalanced, VLA/adapter fields are sparse, scripted placement quality regresses, or Phase 1 produces repeated large deltas/errors.
+- Safety rule: failure keeps the project in observer-only scripted control; success only permits a later lead-reviewed discussion, not live control.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:
