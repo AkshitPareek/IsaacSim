@@ -236,6 +236,115 @@ Conclusion:
 - Next safe step is to collect more dry-run adapter rows and gate by live dry-run behavior, not only offline split metrics.
 - For live autonomy, prefer a bounded waypoint/object-local predictor or a much stricter adapter with clamps and phase-specific validation.
 
+## Swarm Round 6 Task List
+
+Milestone: adapter dry-run reporting and gates before any live VLA control.
+
+Current safety decision:
+
+- No live VLA or affine adapter control is approved for any phase.
+- Scripted Franka control remains the only motion authority.
+- Adapter output may be computed, logged, and reported only in dry-run mode.
+- A future live-control proposal must pass explicit dry-run gates first and require a separate lead review before code enables robot control.
+
+Implementer tasks:
+
+- Implementer G: add adapter dry-run quality gates to the reporting/analyzer path.
+  - Gate adapter rows by phase, accepted/rejected counts, rejection reasons, finite numeric fields, max proposed delta norm, and max/mean adapter error to scripted goals.
+  - Acceptance criteria: a command can fail nonzero when adapter dry-run behavior exceeds configured limits; it prints a concise pass/fail summary by phase; it works without Isaac imports; it can parse existing Round 5 dry-run CSVs.
+- Implementer H: improve adapter dry-run report readability and evidence export.
+  - Add per-phase summaries for readiness, acceptance rate, rejection reasons, error-to-scripted-goal percentiles, delta-norm percentiles, and worst rows with run/step/phase identifiers.
+  - Acceptance criteria: one report gives enough evidence for lead review without opening the CSV manually; unsafe Phase 4-style proposals are obvious; output is stable enough to paste into this memory file.
+- Implementer I: run a larger scripted adapter dry-run collection with the current affine config and no live control.
+  - Collect balanced target-label runs with adapter dry-run enabled, scripted controller unchanged, fresh log directory, and real OpenVLA responses when available.
+  - Acceptance criteria: at least 15 completed scripted runs or a documented simulator failure with partial logs; target labels remain balanced; adapter CSV fields are populated; no generated data is committed unless explicitly requested.
+- Implementer J: propose stricter adapter clamps and phase allowlist defaults, but keep them dry-run only.
+  - Review existing adapter config/load behavior and define conservative defaults for accepted phases, max delta, finite-value checks, and rejection logging.
+  - Acceptance criteria: proposal or implementation cannot enable live control by default; rejected adapter proposals are logged with clear reasons; any live-control flag remains absent or hard-disabled unless separately approved.
+
+Round 6 acceptance gates before any live VLA-control discussion:
+
+- Dataset gates pass for coverage, label balance, VLA query success, empty camera frames, and latency.
+- Adapter dry-run gates pass on a fresh balanced dataset for any candidate phase.
+- Candidate phase has enough accepted adapter dry-run samples, with low error to scripted goal and no large outlier proposals.
+- Rejection reasons are explainable and bounded; no NaN/Inf or malformed adapter fields appear.
+- Phase 0 remains scripted unless a new offline and dry-run method shows a clear, stable improvement over scripted-goal matching.
+- Phase 4 remains blocked until dry-run reports show the large-error proposal pattern is eliminated.
+
+## Completed Swarm Round 6 So Far
+
+New or updated capabilities:
+
+- `analyze_vla_adapter_dryrun.py` analyzes adapter dry-run CSV logs without Isaac imports.
+- It supports older and newer adapter dry-run schemas:
+  - recomputes `adapter_delta_norm` if the explicit column is missing
+  - recomputes `adapter_error_to_scripted` if goal fields are present
+  - treats blank numeric fields as missing, not zero
+  - treats queried VLA rows as successful only when all 7 action fields are present and `vla_error` is blank
+- It reports per-phase:
+  - adapter readiness and acceptance rate
+  - adapter sample counts
+  - delta norm and error-to-scripted percentiles/max
+  - rejection reasons and VLA errors
+  - worst adapter rows by error and by delta norm
+- It can fail nonzero on dry-run gates:
+  - `--required-phases`
+  - `--min-adapter-samples-per-phase`
+  - `--min-accepted-rate`
+  - `--max-adapter-error-p95`
+  - `--max-adapter-error-max`
+  - `--max-adapter-delta-p95`
+  - `--max-adapter-delta-max`
+
+Verification on `vla_calib_logs_adapter_dryrun_test2/calibration.csv`:
+
+- Parsed `161` rows across phases `0,1,2,3,4`.
+- Phase 1 dry-run sample remained plausible: delta norm `0.0312914 m`, error `0.0135648 m`.
+- Phase 4 dry-run sample failed hard: delta norm `0.404124 m`, error `1.5277 m`.
+- Gate command with `--required-phases 1,4 --min-adapter-samples-per-phase 1 --max-adapter-delta-max 0.08 --max-adapter-error-max 0.1` failed as expected.
+- Conclusion remains unchanged: no affine adapter live control; collect a larger scripted dry-run dataset and gate it with this analyzer.
+
+## Runbook: Next Dry-Run Adapter Collection
+
+Purpose:
+
+- Collect a fresh scripted-control Isaac Sim run with OpenVLA and the affine adapter in dry-run mode.
+- Keep scripted Franka control as the only motion authority.
+- Use logged adapter proposals to decide whether the adapter is safe enough for further offline iteration.
+
+Environment:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_adapter_dryrun_next"
+$env:OPENVLA_SERVER_URL="http://localhost:8000/act"
+$env:OPENVLA_ENABLED="1"
+$env:OPENVLA_QUERY_EVERY="10"
+$env:OPENVLA_TIMEOUT="60"
+$env:OPENVLA_ADAPTER_CONFIG="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_balanced_real\affine_adapter_config.json"
+$env:OPENVLA_ADAPTER_DRY_RUN="1"
+$env:OPENVLA_ADAPTER_MAX_DELTA="0.05"
+```
+
+Command:
+
+```powershell
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 6 --seed 2031 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 2 --instruction-template "pick up the blue cube and place it on the {target_label}" --adapter-dry-run 1 --adapter-max-delta 0.05
+```
+
+Expected outputs:
+
+- `vla_calib_logs_adapter_dryrun_next\calibration.csv`
+- Scripted pick-place phases continue normally in console output.
+- CSV includes VLA success/action/latency fields.
+- CSV includes adapter dry-run fields: readiness, acceptance, rejection reason, proposed goal, proposed delta, delta norm, and distance to scripted goal.
+
+Pass/fail interpretation:
+
+- Pass: all scripted runs complete, target labels are balanced, VLA query coverage is adequate, adapter fields are populated, accepted deltas stay within `0.05 m`, and adapter-to-scripted error has no large repeated outliers.
+- Fail: missing/empty CSV, poor VLA success coverage, empty camera frames, high latency, repeated adapter rejections, large proposed deltas, large adapter-to-scripted errors, or any sign that adapter dry-run changed gripper/control behavior.
+- Safety rule: failure means do not enable live control; keep collecting/debugging in observer-only mode.
+
 ## Verification Targets
 
 - Python syntax checks pass for changed standalone scripts/tools.
