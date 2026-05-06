@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", type=str, choices=["cpu", "cuda"], default="cpu")
@@ -39,11 +40,16 @@ parser.add_argument("--runs", type=int, default=3, help="Number of scripted runs
 args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": False})
+
+EXPERIENCE = os.environ.get("ISAACSIM_PYTHON_EXPERIENCE", "")
+if EXPERIENCE:
+    print(f"Using experience: {EXPERIENCE}")
+    simulation_app = SimulationApp({"headless": False}, experience=EXPERIENCE)
+else:
+    simulation_app = SimulationApp({"headless": False})
 
 import csv
 import io
-import os
 import time
 from pathlib import Path
 
@@ -128,6 +134,14 @@ def query_vla(rgb_image: np.ndarray, instruction: str):
         return None, str(e)
 
 
+def as_vec3(value) -> np.ndarray:
+    """Normalize Isaac pose outputs to a flat xyz vector."""
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.size < 3:
+        return np.zeros(3, dtype=np.float32)
+    return arr.reshape(-1)[:3]
+
+
 # ── Scripted goal extraction ──────────────────────────────────────────────────
 def get_scripted_goal(pick_place: FrankaPickPlace) -> np.ndarray:
     """
@@ -143,15 +157,15 @@ def get_scripted_goal(pick_place: FrankaPickPlace) -> np.ndarray:
         return cube_pos[0] + np.array([0.0, 0.0, 0.1])
     elif event == 2:
         _, current_position, _ = pick_place.robot.get_current_state()
-        return current_position  # gripper close, EE stays put
+        return as_vec3(current_position)  # gripper close, EE stays put
     elif event == 3:
         _, current_position, _ = pick_place.robot.get_current_state()
-        return current_position + np.array([0.0, 0.0, 0.2])
+        return as_vec3(current_position) + np.array([0.0, 0.0, 0.2])
     elif event == 4:
         return pick_place.target_position.copy()
     elif event == 5:
         _, current_position, _ = pick_place.robot.get_current_state()
-        return current_position  # gripper open, EE stays put
+        return as_vec3(current_position)  # gripper open, EE stays put
     elif event == 6:
         cube_pos2 = pick_place.cube.get_world_poses()[0].numpy()
         return cube_pos2[0] + np.array([0.0, 0.0, 0.3])
@@ -206,6 +220,7 @@ def main():
 
         try:
             _, ee_pos, _ = pick_place.robot.get_current_state()
+            ee_pos = as_vec3(ee_pos)
         except Exception:
             ee_pos = np.zeros(3)
 
@@ -214,7 +229,7 @@ def main():
         except Exception:
             cube_pos = np.zeros(3)
 
-        scripted_goal = get_scripted_goal(pick_place)
+        scripted_goal = as_vec3(get_scripted_goal(pick_place))
 
         # ── Decide whether to query VLA this step ────────────────────────────
         do_vla_query = (global_step % VLA_QUERY_EVERY == 0) and (phase < len(pick_place.events_dt))
