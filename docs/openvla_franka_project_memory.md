@@ -172,6 +172,27 @@ Current next step:
 - Try phase-specific affine/linear adapters and axis/sign mappings against the balanced dataset.
 - Only enable Phase 0 live control if an offline adapter beats the scripted baseline with enough margin and stable axis diagnostics.
 
+## Completed Swarm Round 4 Local Pass
+
+New or updated capabilities:
+
+- `fit_vla_action_adapter.py` fits an offline affine adapter per phase:
+  - `desired_delta_axis = b + wx*vla_dx + wy*vla_dy + wz*vla_dz`
+  - train/test split is by `run_id`
+  - no Isaac imports and no robot control
+
+Affine adapter result on `vla_calib_logs_balanced_real/calibration.csv`:
+
+- Holdout `0.3`: Phase 0 test worsened by `5.00%`, Phase 1 improved by `27.29%`, Phase 4 improved by `25.19%`.
+- Holdout `0.2`: Phase 0 improved by only `0.44%`, Phase 1 improved by `24.15%`, Phase 4 improved by `32.91%`.
+- Conclusion: Phase 1 and Phase 4 have a real offline adapter signal, but Phase 0 is still not ready for live model control.
+
+Recommended next step:
+
+- Add a guarded dry-run/live-control scaffold for Phase 1 or Phase 4 first, not Phase 0.
+- Keep Phase 0 scripted until we build a better object-local or waypoint predictor.
+- If the goal remains Phase 0 autonomy first, collect richer visual/action labels or switch the model target from raw deltas to object/waypoint prediction.
+
 ## Verification Targets
 
 - Python syntax checks pass for changed standalone scripts/tools.
