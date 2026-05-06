@@ -57,7 +57,7 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 - [ ] Generate a larger randomized observer dataset with real OpenVLA responses.
 - [x] Add dataset quality gates so bad calibration runs are obvious.
 - [x] Add language-conditioned target variants and target labels/colors.
-- [ ] Design a dry-run action adapter that maps VLA/action signals to bounded Franka waypoints.
+- [x] Design a dry-run action adapter that maps VLA/action signals to bounded Franka waypoints.
 - [ ] Validate the adapter offline against logged scripted goals.
 - [ ] Enable model control for Phase 0 reach only.
 - [ ] Expand to language-conditioned place waypoint selection.
@@ -68,7 +68,7 @@ Build toward a Franka Panda pick-and-place system in Isaac Sim where a vision-la
 - [ ] Lead: turn the next milestone into concrete branch tasks and review implementer plans.
 - [x] Implementer D: add dataset quality gates/report thresholds to the analyzer.
 - [x] Implementer E: add target variants, labels, and language templates in observer mode.
-- [ ] Implementer F: design and implement an offline dry-run action adapter report without robot control.
+- [x] Implementer F: design and implement an offline dry-run action adapter report without robot control.
 
 ## Completed Swarm Round 2 So Far
 
@@ -76,17 +76,26 @@ Merged branches:
 
 - `codex/openvla-quality-gates`
 - `codex/openvla-target-variants`
+- `codex/openvla-action-adapter-report`
 
 New or updated capabilities:
 
 - `analyze_vla_calibration.py` can enforce optional quality gates and exits nonzero when requested gates fail.
 - `vla_pick_place.py` logs per-run `target_label` and `instruction`.
 - `vla_pick_place.py` supports target labels and instruction templates while keeping robot control scripted.
+- `report_vla_action_adapter.py` evaluates a bounded VLA xyz-to-waypoint adapter offline.
 
 Test evidence:
 
 - Quality gates pass syntax checks and fail as expected for impossible thresholds such as `--min-runs 999`.
 - Target variants completed 3 dry-run scripted runs with `green target`, `red target`, and `blue target`.
+- Offline adapter report runs on the existing CSV, but flags Phase 0 as `LOW SAMPLE` with only 2 usable rows.
+
+Current next step:
+
+- Generate a larger randomized observer dataset with real OpenVLA responses.
+- Run quality gates and the adapter report on that fresh dataset.
+- Use the resulting evidence to decide whether Phase 0 model control is ready for a guarded live experiment.
 
 ## Verification Targets
 
