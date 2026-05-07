@@ -509,6 +509,101 @@ Round 10 decision:
 - Phase 4 remains blocked.
 - Passing Round 10 does not enable live control; next work should be a separate lead-reviewed Phase 1-only live-control design gate or another dry-run focused on replacing scripted Phase 1 with a bounded controller shadow plan.
 
+## Isaac Runtime Speed-Improvement Task List
+
+Purpose:
+
+- Reduce wall-clock time for scripted-control OpenVLA/adapter evidence collection without weakening safety gates.
+- Keep scripted Franka as the only motion authority unless a separate live-control review explicitly approves otherwise.
+- Prefer runtime flags, launch presets, and report hygiene before changing simulation behavior.
+
+Safety constraints:
+
+- Do not touch generated log directories when tuning runtime presets.
+- Do not relax final placement, label-balance, VLA-success, empty-camera, latency, or adapter dry-run gates just to make a run appear faster.
+- Any speed preset that changes physics/rendering fidelity must be validated against a known-good baseline before it becomes the default.
+- Phase 1 remains the only dry-run adapter candidate; Phase 0 stays scripted and Phase 4 remains blocked.
+
+Task list:
+
+- [ ] Measure a baseline wall-clock profile for the current Round 10 command: total runtime, startup time, per-run duration, query count, latency p95, final placement quality, and adapter gate result.
+- [ ] Add a lightweight timing summary to the collection/report workflow if the existing console and CSV outputs do not already make runtime bottlenecks obvious.
+- [ ] Confirm the minimum camera/image settings needed for OpenVLA queries and adapter dry-run evidence; avoid saving extra images unless a debugging run requires them.
+- [ ] Compare `OPENVLA_QUERY_EVERY` values against Phase 1 sample-count gates so fast runs still collect enough accepted adapter rows.
+- [ ] Keep target labels balanced in every preset; use `--target-label-mode balanced` and set `--runs-per-label` explicitly.
+- [ ] Test whether shorter runs or fewer total runs still satisfy required Phase 1 samples; do not promote a preset unless its gates pass on fresh data.
+- [ ] Document any renderer or launcher choice that improves stability or speed on this Windows/NVIDIA setup, with D3D12 remaining the known explicit fallback path.
+- [ ] Add a run-summary note after each collection that records preset name, seed, run count, query cadence, elapsed time, and pass/fail gate status.
+- [ ] If simulator startup dominates runtime, consider batching multiple presets in one launched Isaac session only if logs remain cleanly separated and no generated logs are committed.
+- [ ] If OpenVLA latency dominates runtime, test server-side batching/caching only in observer mode and only if CSV rows still reflect the exact query response used for each frame.
+
+Proposed collection presets:
+
+| Preset | Purpose | Runs | Labels | Query cadence | Adapter scope | Expected use |
+| --- | --- | ---: | --- | --- | --- | --- |
+| Fast smoke | Verify launch, logging schema, OpenVLA connectivity, and Phase 1 adapter dry-run plumbing quickly. | `3` | `1` each red/green/blue | `OPENVLA_QUERY_EVERY=20` | `--adapter-enabled-phases 1` | Use before longer collections or after small code/runbook changes. Not enough for promotion. |
+| Medium evidence | Catch most runtime and adapter regressions while keeping collection time moderate. | `9` | `3` each red/green/blue | `OPENVLA_QUERY_EVERY=10` | `--adapter-enabled-phases 1` | Use for candidate preset validation and regression checks before spending time on the full run. |
+| Full gate | Reproduce the strict Round 10 decision-quality evidence. | `15` | `5` each red/green/blue | `OPENVLA_QUERY_EVERY=10` | `--adapter-enabled-phases 1` | Required before any lead-reviewed promotion discussion; must pass dataset, final-placement, and Phase 1 adapter gates. |
+
+Preset commands:
+
+```powershell
+# Fast smoke
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 3 --seed 2041 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
+```
+
+```powershell
+# Medium evidence
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 9 --seed 2042 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 3 --instruction-template "pick up the blue cube and place it on the {target_label}" --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
+```
+
+```powershell
+# Full gate
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares --runs 15 --seed 2043 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 5 --instruction-template "pick up the blue cube and place it on the {target_label}" --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
+```
+
+Preset interpretation:
+
+- Fast smoke passes only if the app launches, the CSV is populated, all labels appear once, OpenVLA connectivity works, Phase 1 adapter fields appear, and scripted control is unchanged.
+- Medium evidence passes only if label balance, VLA query coverage, final scripted placement, finite adapter fields, and Phase 1 dry-run bounds look consistent with Round 10.
+- Full gate passes only if it satisfies the strict Round 9/10 gates: `15 / 15` completed scripted runs, `5` runs per label, final XY distance at or below `0.08 m` for every run, and Phase 1 adapter p95/max delta and error remain bounded.
+- No preset enables live control; passing a preset only determines whether the next collection or review step is worth running.
+
+## Completed Isaac Runtime Speed Pass 1
+
+Implemented opt-in runtime knobs:
+
+- `--headless` / `ISAACSIM_HEADLESS` / `OPENVLA_HEADLESS`.
+- `--camera-resolution` / `OPENVLA_CAMERA_RESOLUTION`.
+- `--openvla-enabled-phases` / `OPENVLA_ENABLED_PHASES`.
+- `--openvla-save-image-every` / `OPENVLA_SAVE_IMAGE_EVERY`.
+- `--openvla-max-image-saves` / `OPENVLA_MAX_IMAGE_SAVES`.
+- Runtime summary counters for sampled frames, HTTP queries, VLA errors, and saved images.
+- Startup estimated sample/HTTP counts now respect the VLA phase allowlist.
+
+Verification:
+
+- `python -m py_compile source\standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py` passed.
+- `vla_pick_place.py --help` exposes the new runtime options.
+- No-HTTP headless smoke completed `1` scripted run in about `42.5 s` with `--openvla-enabled 0`, `--openvla-save-images 0`, and `--camera-resolution 160 160`.
+- Real OpenVLA Phase-1-only smoke completed `3` scripted runs in about `121 s` with `--openvla-enabled-phases 1`, `--openvla-save-images 0`, and `--headless 1`.
+
+Real Phase-1-only smoke result:
+
+- Rows/runs: `840` rows, `3` runs.
+- HTTP queries: `12`, matching the new estimate; Round 10 would have made `84` queries for the same `3` runs at all phases.
+- VLA: `12 / 12` successes, latency p95 `3047.47 ms`, `0` empty camera frames.
+- Phase 1 adapter dry-run: PASS, `12 / 12` samples ready and accepted, delta p95/max `0.0499995 m`, error p95/max `0.0591783 m`.
+- Phase 4 safety check: no Phase 4 VLA/adapter candidate samples because VLA querying and adapter dry-run were both Phase 1 scoped.
+- Strict final placement gate: FAIL for this smoke only, `2 / 3` success-like runs with one final distance `0.0993701 m`. Treat this as a runtime/plumbing smoke, not promotion evidence.
+
+Speed decision:
+
+- Use Phase-1-only VLA querying for Phase 1 adapter work. It reduces full-gate OpenVLA calls from about `420` to about `60`, saving roughly `86%` of model wait time while preserving the exact Phase 1 evidence we need.
+- Keep all-phase VLA querying only when collecting data for future phases such as Phase 4 redesign.
+- Keep `--openvla-save-images 0` for speed/regression runs unless debugging image quality.
+- Keep strict full-gate placement requirements for promotion evidence; do not use fast smoke placement results to approve control changes.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:

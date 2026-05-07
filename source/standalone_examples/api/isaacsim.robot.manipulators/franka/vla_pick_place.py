@@ -23,9 +23,14 @@
 #   Set OPENVLA_RUNS_PER_LABEL env var (balanced mode only)
 #   Set OPENVLA_INSTRUCTION_TEMPLATE env var (default: pick up the blue cube and place it on the {target_label})
 #   Set OPENVLA_QUERY_EVERY env var (default: 10, query VLA every N steps)
+#   Set OPENVLA_ENABLED_PHASES env var (optional comma-separated VLA query phase allowlist)
 #   Set OPENVLA_ENABLED env var (default: 1)
 #   Set OPENVLA_TIMEOUT env var (default: 15 seconds)
 #   Set OPENVLA_SAVE_IMAGES env var (default: 1)
+#   Set OPENVLA_SAVE_IMAGE_EVERY env var (default: 1, save every sampled frame)
+#   Set OPENVLA_MAX_IMAGE_SAVES env var (default: 0, unlimited)
+#   Set OPENVLA_CAMERA_RESOLUTION env var (default: 320,320)
+#   Set ISAACSIM_HEADLESS or OPENVLA_HEADLESS env var (default: 0)
 #   Set OPENVLA_DRY_RUN env var (default: 0, save/log frames but skip HTTP)
 #   Set OPENVLA_ADAPTER_CONFIG env var to an affine adapter JSON for dry-run goal logging
 #   Set OPENVLA_ADAPTER_DRY_RUN env var (default: 1 when adapter config is supplied)
@@ -50,6 +55,13 @@ parser.add_argument(
 )
 parser.add_argument("--runs", type=int, default=3, help="Number of scripted runs to collect calibration data from")
 parser.add_argument("--seed", type=int, default=None, help="Seed for randomized cube/target sampling")
+parser.add_argument(
+    "--headless",
+    type=int,
+    choices=[0, 1],
+    default=None,
+    help="Run Isaac Sim headless; defaults to ISAACSIM_HEADLESS/OPENVLA_HEADLESS or 0",
+)
 parser.add_argument("--cube-x-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
 parser.add_argument("--cube-y-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
 parser.add_argument("--target-x-range", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
@@ -57,7 +69,16 @@ parser.add_argument("--target-y-range", type=float, nargs=2, default=None, metav
 parser.add_argument("--openvla-enabled", type=int, choices=[0, 1], default=None, help="Enable OpenVLA HTTP queries")
 parser.add_argument("--openvla-timeout", type=float, default=None, help="OpenVLA HTTP timeout in seconds")
 parser.add_argument("--openvla-save-images", type=int, choices=[0, 1], default=None, help="Save calibration camera frames")
+parser.add_argument("--openvla-save-image-every", type=int, default=None, help="Save every Nth sampled frame")
+parser.add_argument("--openvla-max-image-saves", type=int, default=None, help="Maximum sampled frames to save; 0 means unlimited")
+parser.add_argument("--camera-resolution", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT"))
 parser.add_argument("--openvla-dry-run", type=int, choices=[0, 1], default=None, help="Log state/images but skip OpenVLA HTTP")
+parser.add_argument(
+    "--openvla-enabled-phases",
+    type=str,
+    default=None,
+    help="Optional comma-separated phase allowlist for VLA image sampling/HTTP queries",
+)
 parser.add_argument("--target-labels", type=str, default=None, help="Comma-separated language labels to sample per run")
 parser.add_argument(
     "--target-label-mode",
@@ -113,12 +134,26 @@ args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
 
+def parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def configured_headless() -> bool:
+    if args.headless is not None:
+        return bool(args.headless)
+    return parse_bool_env("ISAACSIM_HEADLESS", parse_bool_env("OPENVLA_HEADLESS", False))
+
+
 EXPERIENCE = os.environ.get("ISAACSIM_PYTHON_EXPERIENCE", "")
+HEADLESS = configured_headless()
 if EXPERIENCE:
     print(f"Using experience: {EXPERIENCE}")
-    simulation_app = SimulationApp({"headless": False}, experience=EXPERIENCE)
+    simulation_app = SimulationApp({"headless": HEADLESS}, experience=EXPERIENCE)
 else:
-    simulation_app = SimulationApp({"headless": False})
+    simulation_app = SimulationApp({"headless": HEADLESS})
 
 import csv
 import io
@@ -151,6 +186,7 @@ DEFAULT_TARGET_LABELS = ("target",)
 DEFAULT_INSTRUCTION_TEMPLATE = "pick up the blue cube and place it on the {target_label}"
 DEFAULT_TARGET_LABEL_MODE = "random"
 DEFAULT_SCRIPTED_STEPS_PER_RUN = 280
+DEFAULT_CAMERA_RESOLUTION = (320, 320)
 
 CSV_FIELDS = [
     "run_id", "phase", "phase_step", "global_step",
@@ -184,17 +220,17 @@ def open_csv():
 
 
 # ── Camera setup ─────────────────────────────────────────────────────────────
-def setup_camera():
+def setup_camera(resolution: tuple[int, int]):
     """Add a fixed overhead camera looking at the workspace."""
     cam = Camera(
         prim_path="/World/CalibCamera",
         position=np.array([0.5, 0.0, 1.2]),
         orientation=np.array([0.0, 0.7071068, 0.7071068, 0.0]),  # looking down
-        resolution=(320, 320),
+        resolution=resolution,
     )
     try:
         cam.initialize()
-        print("Calibration camera initialized at 320x320")
+        print(f"Calibration camera initialized at {resolution[0]}x{resolution[1]}")
     except Exception as e:
         print(f"Camera init warning (may resolve after first frame): {e}")
     return cam
@@ -236,6 +272,45 @@ def configured_timeout() -> float:
     return timeout
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return default if raw is None or raw == "" else int(raw)
+
+
+def env_int_pair(name: str, default: tuple[int, int]) -> tuple[int, int]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    parts = [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"{name} must contain exactly two integer values")
+    return int(parts[0]), int(parts[1])
+
+
+def configured_positive_int(arg_value: int | None, env_name: str, default: int) -> int:
+    value = arg_value if arg_value is not None else env_int(env_name, default)
+    if value <= 0:
+        raise ValueError(f"{env_name} must be positive")
+    return value
+
+
+def configured_non_negative_int(arg_value: int | None, env_name: str, default: int) -> int:
+    value = arg_value if arg_value is not None else env_int(env_name, default)
+    if value < 0:
+        raise ValueError(f"{env_name} must be non-negative")
+    return value
+
+
+def configured_camera_resolution() -> tuple[int, int]:
+    if args.camera_resolution is not None:
+        resolution = (int(args.camera_resolution[0]), int(args.camera_resolution[1]))
+    else:
+        resolution = env_int_pair("OPENVLA_CAMERA_RESOLUTION", DEFAULT_CAMERA_RESOLUTION)
+    if resolution[0] <= 0 or resolution[1] <= 0:
+        raise ValueError("OPENVLA_CAMERA_RESOLUTION values must be positive")
+    return resolution
+
+
 def configured_adapter_config_path() -> Path | None:
     raw = args.adapter_config if args.adapter_config is not None else os.environ.get("OPENVLA_ADAPTER_CONFIG", "")
     if raw is None or raw.strip() == "":
@@ -273,6 +348,15 @@ def configured_adapter_enabled_phases() -> set[int] | None:
         args.adapter_enabled_phases
         if args.adapter_enabled_phases is not None
         else os.environ.get("OPENVLA_ADAPTER_ENABLED_PHASES")
+    )
+    return parse_adapter_enabled_phases(raw)
+
+
+def configured_vla_enabled_phases() -> set[int] | None:
+    raw = (
+        args.openvla_enabled_phases
+        if args.openvla_enabled_phases is not None
+        else os.environ.get("OPENVLA_ENABLED_PHASES", os.environ.get("OPENVLA_QUERY_PHASES", ""))
     )
     return parse_adapter_enabled_phases(raw)
 
@@ -422,6 +506,23 @@ def estimate_vla_samples(total_runs: int) -> int:
     return int(np.ceil((total_runs * DEFAULT_SCRIPTED_STEPS_PER_RUN) / max(VLA_QUERY_EVERY, 1)))
 
 
+def estimate_vla_samples_for_phases(total_runs: int, enabled_phases: set[int] | None) -> int:
+    if enabled_phases is None:
+        return estimate_vla_samples(total_runs)
+    per_run_steps = sum(
+        steps
+        for phase, steps in enumerate((60, 40, 20, 40, 80, 20, 20))
+        if phase in enabled_phases
+    )
+    return int(np.ceil((total_runs * per_run_steps) / max(VLA_QUERY_EVERY, 1)))
+
+
+def should_save_sampled_image(sample_index: int, save_every: int, max_saves: int, saved_count: int) -> bool:
+    if (sample_index - 1) % save_every != 0:
+        return False
+    return max_saves == 0 or saved_count < max_saves
+
+
 def sample_xy(rng: np.random.Generator, x_range: tuple[float, float], y_range: tuple[float, float]) -> np.ndarray:
     return np.array(
         [
@@ -527,12 +628,26 @@ def get_scripted_goal(pick_place: FrankaPickPlace) -> np.ndarray:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    if VLA_QUERY_EVERY <= 0:
+        raise ValueError("OPENVLA_QUERY_EVERY must be positive")
     seed = configured_seed()
     rng = np.random.default_rng(seed)
     vla_enabled = configured_flag(args.openvla_enabled, "OPENVLA_ENABLED", True)
     vla_save_images = configured_flag(args.openvla_save_images, "OPENVLA_SAVE_IMAGES", True)
+    vla_save_image_every = configured_positive_int(
+        args.openvla_save_image_every,
+        "OPENVLA_SAVE_IMAGE_EVERY",
+        1,
+    )
+    vla_max_image_saves = configured_non_negative_int(
+        args.openvla_max_image_saves,
+        "OPENVLA_MAX_IMAGE_SAVES",
+        0,
+    )
     vla_dry_run = configured_flag(args.openvla_dry_run, "OPENVLA_DRY_RUN", False)
     vla_timeout = configured_timeout()
+    vla_enabled_phases = configured_vla_enabled_phases()
+    camera_resolution = configured_camera_resolution()
     adapter_config = load_adapter_config(configured_adapter_config_path())
     adapter_dry_run = configured_flag(args.adapter_dry_run, "OPENVLA_ADAPTER_DRY_RUN", adapter_config is not None)
     adapter_max_delta = configured_adapter_max_delta()
@@ -555,7 +670,7 @@ def main():
     if min_distance < 0:
         raise ValueError("Minimum cube-target distance must be non-negative")
 
-    estimated_vla_samples = estimate_vla_samples(total_runs)
+    estimated_vla_samples = estimate_vla_samples_for_phases(total_runs, vla_enabled_phases)
     estimated_http_calls = 0 if (not vla_enabled or vla_dry_run) else estimated_vla_samples
     if adapter_dry_run and adapter_config is None:
         print("Adapter dry-run requested but no adapter config was supplied; adapter fields will be blank.")
@@ -563,14 +678,26 @@ def main():
         print("Adapter config supplied but adapter dry-run is disabled; adapter fields will be blank.")
 
     print(f"VLA Calibration Experiment")
+    print(f"  Headless:    {int(HEADLESS)}")
     print(f"  Runs:        {total_runs}")
     print(f"  VLA enabled: {int(vla_enabled)}")
     print(f"  VLA server:  {VLA_SERVER_URL}")
     print(f"  Query every: {VLA_QUERY_EVERY} steps")
+    print(
+        "  VLA phases:  "
+        + (
+            "all"
+            if vla_enabled_phases is None
+            else ", ".join(str(phase) for phase in sorted(vla_enabled_phases))
+        )
+    )
     print(f"  Est. samples:{estimated_vla_samples}")
     print(f"  Est. HTTP:   {estimated_http_calls}")
     print(f"  Timeout:     {vla_timeout:g} seconds")
     print(f"  Save images: {int(vla_save_images)}")
+    print(f"  Save every:  {vla_save_image_every} sampled frame(s)")
+    print(f"  Max images:  {vla_max_image_saves if vla_max_image_saves else 'unlimited'}")
+    print(f"  Camera res:  {camera_resolution[0]}x{camera_resolution[1]}")
     print(f"  Dry run:     {int(vla_dry_run)}")
     print(f"  Adapter dry: {int(adapter_dry_run)}")
     print(f"  Adapter max delta: {adapter_max_delta:g} m")
@@ -607,7 +734,7 @@ def main():
     omni.timeline.get_timeline_interface().play()
     simulation_app.update()
 
-    camera = setup_camera()
+    camera = setup_camera(camera_resolution)
     simulation_app.update()
 
     csv_file, writer = open_csv()
@@ -619,6 +746,10 @@ def main():
     reset_needed  = True
     current_target_label = ""
     current_instruction = build_instruction(instruction_template, target_labels[0])
+    sampled_vla_frames = 0
+    http_queries = 0
+    images_saved = 0
+    vla_errors = 0
 
     print(f"\nStarting calibration data collection (run 1 of {total_runs})...")
 
@@ -683,6 +814,7 @@ def main():
             vla_enabled
             and (global_step % VLA_QUERY_EVERY == 0)
             and (phase < len(pick_place.events_dt))
+            and (vla_enabled_phases is None or phase in vla_enabled_phases)
         )
         do_vla_query = should_sample_vla and not vla_dry_run
         vla_action   = None
@@ -698,18 +830,26 @@ def main():
         adapter_error_to_scripted = ""
 
         if should_sample_vla:
+            sampled_vla_frames += 1
             try:
                 rgb = camera.get_rgb()
                 if rgb is not None and rgb.size > 0:
-                    if vla_save_images:
+                    if vla_save_images and should_save_sampled_image(
+                        sampled_vla_frames,
+                        vla_save_image_every,
+                        vla_max_image_saves,
+                        images_saved,
+                    ):
                         fname = IMAGE_DIR / f"run{run_id}_ph{phase}_s{phase_step:04d}.png"
                         import cv2
                         cv2.imwrite(str(fname), cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
                         image_path = str(fname)
+                        images_saved += 1
 
                     if vla_dry_run:
                         print(f"  [ph{phase} s{phase_step:3d}] VLA dry run: HTTP skipped")
                     else:
+                        http_queries += 1
                         vla_action, vla_error, vla_latency_ms = query_vla(rgb, current_instruction, vla_timeout)
                         if vla_action is not None:
                             print(
@@ -721,10 +861,13 @@ def main():
                                 f"  [ph{phase} s{phase_step:3d}] VLA error "
                                 f"({vla_latency_ms} ms): {vla_error[:60]}"
                             )
+                            vla_errors += 1
                 else:
                     vla_error = "empty camera frame"
+                    vla_errors += 1
             except Exception as e:
                 vla_error = str(e)
+                vla_errors += 1
 
         if adapter_dry_run and adapter_config is not None and vla_action is not None:
             phase_config = adapter_phase_config(adapter_config, phase)
@@ -809,6 +952,11 @@ def main():
             print(f"Run {current_run} complete.")
             if current_run >= total_runs:
                 print(f"\nAll {total_runs} calibration runs complete.")
+                print("Run summary:")
+                print(f"  Sampled frames: {sampled_vla_frames}")
+                print(f"  HTTP queries:   {http_queries}")
+                print(f"  VLA errors:     {vla_errors}")
+                print(f"  Images saved:   {images_saved}")
                 print(f"CSV saved to: {CSV_PATH}")
                 print(f"Images saved to: {IMAGE_DIR}")
                 break
