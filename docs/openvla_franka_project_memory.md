@@ -661,13 +661,143 @@ Abort and fallback rules for any later live-control proposal:
 
 Round 11 pass/fail checklist:
 
-- [ ] PASS: docs clearly say full live control is not approved.
-- [ ] PASS: Phase 1 is the only candidate phase in design language, commands, gates, and review templates.
-- [ ] PASS: Phase 0 and Phase 4 are explicitly blocked from live-control consideration.
-- [ ] PASS: all safety constraints, required gates, and abort/fallback rules are documented before implementation work begins.
-- [ ] PASS: future implementation work is separated into a later lead-reviewed task and defaults to scripted control.
+- [x] PASS: docs clearly say full live control is not approved.
+- [x] PASS: Phase 1 is the only candidate phase in design language, commands, gates, and review templates.
+- [x] PASS: Phase 0 and Phase 4 are explicitly blocked from live-control consideration.
+- [x] PASS: all safety constraints, required gates, and abort/fallback rules are documented before implementation work begins.
+- [x] PASS: future implementation work is separated into a later lead-reviewed task and defaults to scripted control.
 - [ ] FAIL: any code implements robot control, continuous policy control, gripper authority, Phase 0/Phase 4 authority, or a live-control default.
 - [ ] FAIL: any gate is weakened for speed, any generated log data is committed unintentionally, or old adapter metadata is used as approval.
+
+## Round 11 Design Spec (AA–AE)
+
+This section satisfies the AA–AE acceptance criteria above with concrete values, drawing on the Round 10 dry-run evidence and the Phase 1 scaffold currently committed off-by-default in `vla_pick_place.py`.
+
+### AA — Phase 1-only experiment boundary
+
+In-scope (one and only one allowed experiment shape):
+
+- Phase: `1` only (transport / approach to grasp). The scripted controller continues to drive Phase 0 (initial reach), Phase 2/3 (descent/grasp), and Phase 4 (place).
+- Authority: zero or one Cartesian end-effector pose update per Phase 1 step, derived from `apply_phase1_adapter_control` in `vla_pick_place.py`. No joint control, no gripper authority, no continuous closed-loop control across phases.
+- Mode progression: dry-run → shadow (adapter computes, scripted moves) → `live-once` (one full pick-place with Phase 1 adapter pose updates, operator armed, headed display visible).
+- Dataset of record: a fresh `15 / 15` Phase 1-only scripted dry-run run that satisfies Round 10 strict gates with the Speed Pass 1 query scope.
+
+Forbidden under Round 11:
+
+- Phase 0 live control. Phase 0 stays scripted.
+- Phase 4 live control. The current affine adapter is rejected for Phase 4 due to transport-sized deltas (max delta `0.586 m`, max error `0.702 m`, accepted `0 / 48` in the dry-run evidence).
+- Gripper or joint commands from VLA/adapter output.
+- Continuous closed-loop control or multi-phase policy authority.
+- Default-on live control for any future flag.
+
+Dry-run evidence used (from `vla_calib_logs_phase1_adapter_dryrun_round10`):
+
+- `15 / 15` scripted runs, balanced red/green/blue at `5 / 5 / 5`.
+- Phase 1 samples `60`, accepted `55 / 60` = `0.917`, `60 / 60` VLA success.
+- Delta norm: mean `0.0438 m`, p95 `0.0505 m`, max `0.0506 m`.
+- Error to scripted goal: mean `0.0306 m`, p95 `0.0592 m`, max `0.0610 m`.
+- Final placement: mean `0.0308 m`, max `0.0669 m` (under the `0.08 m` gate).
+- Phase 4 candidate samples: `0` (allowlist disabled), Phase 4 adapter ready rate `0 / 120`.
+
+Non-goals:
+
+- Improving model accuracy.
+- Replacing the scripted controller anywhere outside Phase 1.
+- Removing the dry-run/shadow modes once live mode is reviewed.
+- Reusing this scaffold for any other phase, robot, task, or model without a new design gate.
+
+Approval state: full live control is **not** approved by Round 11. The scaffold in code is gated off; passing Round 11 only allows a separately reviewed proposal to schedule a `live-once` smoke after the dry-run gates below pass on fresh data.
+
+### AB — Pre-live evidence checklist
+
+Run in this order; every item must pass before lead review can be requested.
+
+1. **Source-control hygiene**: working tree clean for committed code; no `vla_calib_logs_*` directories staged. Verify with `git status` before each evidence collection.
+2. **Fast smoke** (`3` runs, `query_every=20`, dry-run only) using the Phase 1 scaffold runbook command for `vla_calib_logs_phase1_scaffold_smoke_dryrun`. Required: `analyze_vla_calibration.py` PASS with `--min-runs 3 --min-label-count 3 --min-runs-per-label 1 --min-query-successes-per-phase 12`; `analyze_vla_adapter_dryrun.py` PASS with `--phase 1 --min-adapter-samples-per-phase 12 --require-ready --min-accepted-rate 0.90 --min-vla-success-rate 1.0 --max-adapter-delta-max 0.055 --max-adapter-error-max 0.07`.
+3. **Medium evidence** (`9` runs, `query_every=10`, dry-run only) using the medium runbook command. Required: dataset gate PASS with `--min-runs 9 --min-runs-per-label 3 --min-query-successes-per-phase 36 --max-final-distance 0.08`; adapter gate PASS at the same thresholds as full-gate but with `--min-adapter-samples-per-phase 36`.
+4. **Full dry-run gate** (`15` runs, `query_every=10`, dry-run only). Required: every Round 10 numeric threshold reproduced or beaten — `15 / 15` runs, balanced labels at `5` each, final distance max `≤ 0.08 m`, latency p95 `≤ 4000 ms`, empty camera frames `≤ 1`, Phase 1 accepted rate `≥ 0.90`, p95/max delta `≤ 0.052 / 0.055 m`, p95/max error `≤ 0.065 / 0.07 m`.
+5. **Phase 4 negative check**: rerun adapter analyzer against the same CSV with `--phase 4`. Must continue to FAIL or report `0` candidate samples (allowlist disabled). Phase 4 acceptance numbers may not appear anywhere in the review packet.
+6. **Scope sweep**: grep the latest collection commands and shell history for any flag that would enable Phase 0 or Phase 4 control. None permitted.
+7. **Scaffold off-by-default check**: confirm `vla_pick_place.py --help` still shows `--phase1-adapter-control` defaulting to off and that a launch without that flag does not log `adapter_control_applied=1`.
+
+Pass/fail interpretation: every item must PASS. Any single FAIL keeps the project in observer/dry-run-only mode and triggers a fresh recollection or a redesign discussion, not a threshold loosening.
+
+### AC — Phase 1 control envelope (design only, not yet implemented)
+
+Numeric envelope, all stricter than the Round 10 dry-run maxima:
+
+| Constraint | Value | Source |
+| --- | --- | --- |
+| Max single-step Cartesian delta norm (Phase 1 only) | `0.030 m` | Half of the Round 10 dry-run cap of `0.05 m`; below the dry-run mean of `0.044 m` so most steps fall back to scripted intentionally. |
+| Max XY workspace radius from cube spawn region | `0.30 m` | Existing cube/target XY ranges plus margin; reject any goal outside this disk. |
+| Z range (Phase 1 transport altitude) | `[0.05 m, 0.40 m]` above table plane | Phase 1 is approach above the cube; below `0.05 m` is grasp territory and out of scope. |
+| Per-launch live-control step budget (`live-once` mode) | `1` step | Single update; subsequent Phase 1 steps revert to scripted. |
+| Per-run live-control invocation count | `≤ 1` | One `live-once` invocation per scripted run. |
+| Stale VLA timeout | `1.5 s` from query start | If response not back, fall back. |
+| VLA query age allowed at apply time | `≤ 0.5 s` | Older responses fall back. |
+| Adapter readiness | required `True` | `adapter_ready != 1` falls back. |
+| Adapter `delta_norm` finite check | `np.isfinite` on every component | NaN/Inf falls back. |
+| Phase guard | `current_phase == 1` at apply time | Phase mismatch aborts. |
+| Allowlist guards | `--openvla-enabled-phases 1` AND `--adapter-enabled-phases 1` AND `--phase1-adapter-control 1` | Already enforced at startup in code. |
+| Gripper command source | scripted only | Live mode never writes gripper joint targets. |
+| Operator arm flag | required true at launch | A future `--phase1-control-require-operator-arm 1` flag must be present and acknowledged. |
+| Default fallback | scripted forward step | Existing `forward(args.ik_method)` behavior. |
+
+Implementation notes:
+
+- The current scaffold already enforces the allowlist + dry-run-off + adapter-config-loaded preconditions at startup. The remaining envelope items (`max-delta 0.030`, workspace radius, Z range, step budget, query-age check, operator-arm flag) are unimplemented and must be added in a separate review-gated PR before any `live-once` run.
+- Workspace and altitude checks should be applied to the proposed adapter goal itself, not just the delta, to reject teleport-style proposals.
+
+### AD — Abort, fallback, and rollback rules
+
+Abort (run ends, simulator stops, no further Phase 1 live control until a new review):
+
+- OpenVLA HTTP timeout, transport error, or non-2xx response.
+- VLA action not 7D, contains NaN/Inf, or has malformed fields.
+- Adapter config missing or incompatible at runtime.
+- Phase mismatch at apply time (current phase ≠ 1).
+- Workspace, altitude, or `max-delta` envelope violation in `live-once` mode (in `shadow` mode this becomes a fallback, not an abort).
+- Camera read returns empty frame or stale timestamp on the Phase 1 sampling step.
+- Simulator instability: PhysX warning escalation, joint divergence, gripper unexpected open/close.
+- Final-placement gate miss in the same run before Phase 1 lives (i.e., if Phase 0 is already off-track, abort live mode for the rest of the run).
+- Operator abort (keyboard interrupt, kill signal).
+
+Fallback (scripted controller continues this run, live authority disabled for the rest of the run):
+
+- Adapter `accepted=0` for any reason in dry-run/shadow.
+- Adapter readiness false.
+- Stale VLA response (older than the query-age threshold).
+- Workspace, altitude, or delta envelope violation in `shadow` mode.
+- Any analyzer field non-finite.
+
+Rollback (system-level):
+
+- After any abort, the run is preserved but flagged. The scaffold must not re-arm Phase 1 live in the same Isaac Sim session; relaunch is required.
+- After any fallback, the same Isaac session may continue, but `live-once` invocations remain consumed for the run.
+- Two consecutive abort events across runs trigger a Round 11 redesign rather than another `live-once` retry.
+- If any envelope constant is widened, a fresh full dry-run gate must pass first.
+
+Implementation notes:
+
+- Operator abort already works via the simulator close/keyboard-interrupt path. The scaffold relies on `adapter-control-fallback {scripted, abort}`, which already implements the basic fallback/abort split per step; the per-run "no re-arm" rule and consecutive-abort policy require a small launcher state machine and have not been coded.
+
+### AE — Lead review packet template
+
+Include all of the following before requesting a lead review for any Phase 1 `live-once` proposal:
+
+1. **Header**: round (`11`), candidate phase (`1`), proposal mode (`shadow` or `live-once`), date, operator, expected duration, fallback flag.
+2. **Repository state**: `git rev-parse HEAD`, `git status --porcelain`, `git diff --stat origin/main...HEAD`, list of changed files since the last accepted dry-run gate.
+3. **Scaffold proof**: pasted output of `vla_pick_place.py --help` showing `--phase1-adapter-control` default off; pasted snippet of startup preconditions in `main()` that refuse mismatched configs.
+4. **Pre-live evidence (AB)**: command lines used for fast/medium/full collections; analyzer commands; pass/fail line for each gate; dataset locations (uncommitted).
+5. **Numeric summary (Phase 1 only)**: runs completed, balanced label counts, VLA success counts, latency p50/p95/max, empty-camera count, scripted final-placement mean/max, adapter accepted/rejected counts, delta p50/p95/max, error p50/p95/max.
+6. **Worst rows**: top `5` worst Phase 1 adapter rows by error and by delta norm, with `run_id`, `phase`, `target_label`, `adapter_delta`, `adapter_error_to_scripted`, `adapter_rejected_reason`.
+7. **Phase 4 negative**: confirmation that the same dataset shows Phase 4 as `0` candidate samples or the allowlist-disabled rejection reason.
+8. **Envelope reconciliation**: table of AC envelope values vs. the observed Round 10 dry-run maxima; explicit margin for each row.
+9. **Risk assessment**: known failure modes with the proposed mitigation; what is *not* mitigated; explicit list of cases where the scaffold falls back vs. aborts.
+10. **Go/no-go ask**: one of `continue dry-run`, `tighten and recollect`, `request shadow review`, `request live-once review`. Each option lists the scope of the next experiment.
+11. **Confirmation**: explicit one-liner that no live-control code path defaults on, no Phase 0 / Phase 4 control is being requested, and no generated log data is staged for commit.
+
+Acceptance: lead may approve or reject the packet. Approval is for the named experiment only and does not extend to subsequent runs without a fresh packet.
 
 ## Runbook: Next Dry-Run Adapter Collection
 
