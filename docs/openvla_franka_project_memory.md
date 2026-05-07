@@ -604,6 +604,71 @@ Speed decision:
 - Keep `--openvla-save-images 0` for speed/regression runs unless debugging image quality.
 - Keep strict full-gate placement requirements for promotion evidence; do not use fast smoke placement results to approve control changes.
 
+## Swarm Round 11 Task List
+
+Milestone: create a Phase 1-only live-control design gate after Round 10 and Speed Pass 1.
+
+Current safety decision:
+
+- Full live control is not approved.
+- No code path may give OpenVLA, the affine adapter, or any learned policy robot motion authority in Round 11.
+- Scripted Franka control remains the only approved motion authority while Round 11 designs, reviews, and documents a future Phase 1-only live-control gate.
+- Phase 1 is the only phase eligible for design-gate discussion because Round 10 produced bounded dry-run evidence and Speed Pass 1 showed Phase-1-only querying can preserve evidence while reducing query load.
+- Phase 0 remains scripted. Phase 4 remains blocked. Old adapter `ready_for_control` metadata must not be treated as current approval.
+- Generated logs, screenshots, and calibration datasets stay out of commits unless explicitly requested.
+
+Safety constraints:
+
+- The design gate must be Phase 1-only: query scope, adapter scope, candidate summaries, commands, and review language must name only phase `1`.
+- The design gate must not relax Round 10 gates for speed: `15 / 15` scripted runs, balanced labels, final XY distance at or below `0.08 m` for every run, adequate VLA success coverage, bounded latency, no empty-camera spike, and bounded Phase 1 adapter deltas/errors.
+- Any future live-control design must be single-step or shadowed Phase 1 waypoint replacement only; it must not approve full pick-place, Phase 0 reach, Phase 4 place, gripper autonomy, continuous closed-loop control, or policy authority across phases.
+- Motion limits in the future design must be stricter than the dry-run evidence: bounded Cartesian delta, bounded workspace, finite numeric checks, rate/step limits, and explicit rejection on stale, missing, malformed, or out-of-phase VLA/adapter data.
+- The scripted controller must remain available as immediate fallback and must be the default behavior on every launch.
+- The design must include an operator-visible abort path before any later implementation can be reviewed.
+- Any later implementation proposal must require a separate lead review after this design gate passes; Round 11 itself does not implement robot control.
+
+Implementation tasks:
+
+- [ ] Implementer AA: write the Phase 1-only live-control design specification in this memory file or a linked docs-only section.
+  - Acceptance criteria: describes the exact allowed experiment boundary, candidate phase `1`, forbidden phases `0` and `4`, dry-run evidence used, non-goals, and explicit statement that full live control is not approved.
+- [ ] Implementer AB: define the pre-live evidence checklist using existing analyzers.
+  - Acceptance criteria: checklist names the Round 10 full-gate requirements, Speed Pass 1 Phase-1-only query scope, final placement gate, adapter dry-run gate, required command options, and pass/fail interpretation.
+- [ ] Implementer AC: define the future Phase 1 control envelope without coding it.
+  - Acceptance criteria: specifies max Cartesian delta, workspace bounds, finite-value checks, phase allowlist, stale-response timeout, one-step command budget, gripper lockout, and default fallback to scripted control.
+- [ ] Implementer AD: define abort, fallback, and rollback rules.
+  - Acceptance criteria: covers operator abort, adapter rejection, OpenVLA timeout/error, camera/image failure, phase mismatch, simulator instability, final-placement miss, unexpected gripper or joint behavior, and any threshold breach.
+- [ ] Implementer AE: prepare the lead review packet template.
+  - Acceptance criteria: template requires collection command, git status, changed files, analyzer outputs, worst adapter rows, screenshots only if needed, risk assessment, explicit go/no-go recommendation, and confirmation that no live-control implementation was merged.
+
+Required gates before a later Phase 1 live-control implementation may even be proposed:
+
+- Documentation gate: Round 11 design checklist is complete, reviewed, and still states that full live control is not approved.
+- Scope gate: every command and report uses `--openvla-enabled-phases 1` and `--adapter-enabled-phases 1`; no candidate summary includes Phase 0 or Phase 4.
+- Dataset gate: a fresh full-gate scripted run passes `15 / 15` completed runs, balanced red/green/blue labels at `5` each, adequate VLA success coverage, latency and empty-camera thresholds, and no generated logs committed.
+- Final-placement gate: every completed scripted run ends with cube-to-target XY distance at or below `0.08 m`; one miss blocks promotion.
+- Adapter dry-run gate: Phase 1 has enough samples, `100%` VLA success for queried Phase 1 rows, adapter readiness populated, accepted rate consistent with Round 10 or better, p95/max delta and p95/max error bounded, finite fields only, and no repeated outlier pattern.
+- Safety-envelope gate: proposed future control limits are tighter than observed Round 10 dry-run maxima or explicitly justified by a lead-reviewed margin.
+- Review gate: the lead signs off on a separate implementation task after reading the review packet; passing gates does not itself authorize code changes.
+
+Abort and fallback rules for any later live-control proposal:
+
+- Abort immediately if OpenVLA times out, returns a malformed/non-7D action, returns NaN/Inf, or produces data for a phase other than `1`.
+- Abort immediately if camera frames are empty/stale, target labels are missing or imbalanced in the evidence run, or the simulator reports instability.
+- Reject the adapter proposal and fall back to scripted Phase 1 if the proposed delta exceeds the configured cap, leaves the workspace envelope, has stale timestamps, or lacks a matching scripted-control context row.
+- Fall back to scripted control on any operator stop, keyboard interrupt, unexpected gripper command, unexpected joint jump, phase transition mismatch, final-placement miss, or analyzer gate failure.
+- After any abort/fallback event, do not resume live authority in the same run; finish scripted-only if safe, preserve logs, and require a new review before retrying.
+- If any ambiguity appears between speed settings and safety evidence, choose the slower known-good full-gate path.
+
+Round 11 pass/fail checklist:
+
+- [ ] PASS: docs clearly say full live control is not approved.
+- [ ] PASS: Phase 1 is the only candidate phase in design language, commands, gates, and review templates.
+- [ ] PASS: Phase 0 and Phase 4 are explicitly blocked from live-control consideration.
+- [ ] PASS: all safety constraints, required gates, and abort/fallback rules are documented before implementation work begins.
+- [ ] PASS: future implementation work is separated into a later lead-reviewed task and defaults to scripted control.
+- [ ] FAIL: any code implements robot control, continuous policy control, gripper authority, Phase 0/Phase 4 authority, or a live-control default.
+- [ ] FAIL: any gate is weakened for speed, any generated log data is committed unintentionally, or old adapter metadata is used as approval.
+
 ## Runbook: Next Dry-Run Adapter Collection
 
 Purpose:
@@ -646,6 +711,105 @@ Pass/fail interpretation:
 - Pass: all scripted runs complete, target labels are balanced, VLA query coverage is adequate, adapter fields are populated, accepted deltas stay within `0.05 m`, and adapter-to-scripted error has no large repeated outliers.
 - Fail: missing/empty CSV, poor VLA success coverage, empty camera frames, high latency, repeated adapter rejections, large proposed deltas, large adapter-to-scripted errors, or any sign that adapter dry-run changed gripper/control behavior.
 - Safety rule: failure means do not enable live control; keep collecting/debugging in observer-only mode.
+
+## Runbook: Phase 1-Only Scaffold Validation Commands
+
+Purpose:
+
+- Validate a future Phase 1-only control scaffold without weakening the current safety boundary.
+- Keep the current dry-run commands runnable today; treat live-control commands below as the exact proposed CLI contract for a later implementation review.
+- Phase 1 is the only candidate phase. Phase 0 and Phase 4 must stay scripted/blocked in commands, reports, gates, and review notes.
+
+Common environment:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_SERVER_URL="http://localhost:8000/act"
+$env:OPENVLA_ENABLED="1"
+$env:OPENVLA_TIMEOUT="60"
+$env:OPENVLA_ADAPTER_CONFIG="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_balanced_real\affine_adapter_config.json"
+$env:OPENVLA_ADAPTER_MAX_DELTA="0.05"
+$env:OPENVLA_ADAPTER_ENABLED_PHASES="1"
+$env:OPENVLA_ENABLED_PHASES="1"
+$env:OPENVLA_SAVE_IMAGES="0"
+$env:OPENVLA_QUERY_EVERY="10"
+```
+
+Fast smoke dry-run:
+
+```powershell
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_smoke_dryrun"
+$env:OPENVLA_QUERY_EVERY="20"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 1 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 3 --seed 2051 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
+```
+
+Fast smoke gates:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_calibration.py --csv vla_calib_logs_phase1_scaffold_smoke_dryrun\calibration.csv --required-phases 1 --min-runs 3 --min-label-count 3 --min-runs-per-label 1 --min-query-successes-per-phase 12 --max-empty-camera-frames 0 --max-vla-latency-p95-ms 4000
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_adapter_dryrun.py --csv vla_calib_logs_phase1_scaffold_smoke_dryrun\calibration.csv --phase 1 --required-phases 1 --min-adapter-samples-per-phase 12 --require-ready --min-accepted-rate 0.90 --min-vla-success-rate 1.0 --max-adapter-delta-p95 0.052 --max-adapter-delta-max 0.055 --max-adapter-error-p95 0.065 --max-adapter-error-max 0.07 --worst-rows 3
+```
+
+Medium dry-run:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_medium_dryrun"
+$env:OPENVLA_QUERY_EVERY="10"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 1 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 9 --seed 2052 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 3 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
+```
+
+Medium gates:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_calibration.py --csv vla_calib_logs_phase1_scaffold_medium_dryrun\calibration.csv --required-phases 1 --min-runs 9 --min-label-count 3 --min-runs-per-label 3 --min-query-successes-per-phase 36 --max-empty-camera-frames 1 --max-vla-latency-p95-ms 4000 --final-distance-threshold 0.08 --min-success-like-runs 9 --max-final-distance 0.08
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_adapter_dryrun.py --csv vla_calib_logs_phase1_scaffold_medium_dryrun\calibration.csv --phase 1 --required-phases 1 --min-adapter-samples-per-phase 36 --require-ready --min-accepted-rate 0.90 --min-vla-success-rate 0.98 --max-adapter-delta-p95 0.052 --max-adapter-delta-max 0.055 --max-adapter-error-p95 0.065 --max-adapter-error-max 0.07 --worst-rows 5
+```
+
+Full dry-run gate:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_full_dryrun"
+$env:OPENVLA_QUERY_EVERY="10"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 1 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 15 --seed 2053 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 5 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1
+```
+
+Full gates:
+
+```powershell
+cd C:\Users\Akshit\Projects\isaacsim
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_calibration.py --csv vla_calib_logs_phase1_scaffold_full_dryrun\calibration.csv --required-phases 1 --min-runs 15 --min-label-count 3 --min-runs-per-label 5 --min-query-successes-per-phase 60 --max-empty-camera-frames 1 --max-vla-latency-p95-ms 4000 --final-distance-threshold 0.08 --min-success-like-runs 15 --max-final-distance 0.08
+python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_adapter_dryrun.py --csv vla_calib_logs_phase1_scaffold_full_dryrun\calibration.csv --phase 1 --required-phases 1 --min-adapter-samples-per-phase 60 --require-ready --min-accepted-rate 0.90 --min-vla-success-rate 0.98 --max-adapter-delta-p95 0.052 --max-adapter-delta-max 0.055 --max-adapter-error-p95 0.065 --max-adapter-error-max 0.07 --worst-rows 5
+```
+
+Future live-control scaffold commands, proposed contract only:
+
+```powershell
+# Live-control scaffold fast validation must default to shadow mode first.
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_smoke_shadow"
+$env:OPENVLA_QUERY_EVERY="20"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 1 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 3 --seed 2061 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1 --phase1-control-mode shadow --phase1-control-max-delta 0.03 --phase1-control-max-steps 1 --phase1-control-gripper-lock 1 --phase1-control-require-operator-arm 1
+```
+
+```powershell
+# First live-control scaffold smoke, only after full dry-run gates and lead review pass.
+cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
+$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_smoke_live_once"
+$env:OPENVLA_QUERY_EVERY="20"
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 0 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 3 --seed 2062 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 0 --adapter-max-delta 0.03 --adapter-enabled-phases 1 --phase1-control-mode live-once --phase1-control-max-delta 0.03 --phase1-control-max-steps 1 --phase1-control-gripper-lock 1 --phase1-control-require-operator-arm 1 --phase1-control-abort-on-reject 1
+```
+
+Live-control scaffold review gates:
+
+- Do not run any `live-once` command until the full dry-run gate above passes on a fresh dataset and lead review explicitly approves the single experiment.
+- The future scaffold must reject startup unless `--openvla-enabled-phases 1`, `--adapter-enabled-phases 1`, `--phase1-control-max-steps 1`, `--phase1-control-gripper-lock 1`, and `--phase1-control-require-operator-arm 1` are present.
+- Fast smoke is for plumbing only; medium is for regression confidence; full is the only dry-run gate acceptable before a live-control review packet.
+- For the first live smoke, use `--headless 0` so the operator can see and abort the run. Any timeout, malformed action, adapter rejection, phase mismatch, unexpected gripper command, final-distance miss, simulator instability, or analyzer failure blocks further live attempts.
+- After live smoke, run the same dataset and adapter analyzers where applicable, plus a manual review of scaffold-specific columns for `control_mode`, `control_applied`, `control_rejected_reason`, `operator_armed`, and `abort_reason`.
 
 ## Verification Targets
 
