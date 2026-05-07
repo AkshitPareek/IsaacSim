@@ -36,6 +36,9 @@
 #   Set OPENVLA_ADAPTER_DRY_RUN env var (default: 1 when adapter config is supplied)
 #   Set OPENVLA_ADAPTER_MAX_DELTA env var (default: 0.08 meters, reject larger dry-run deltas)
 #   Set OPENVLA_ADAPTER_ENABLED_PHASES env var (optional comma-separated phase allowlist)
+#   Set OPENVLA_PHASE1_ADAPTER_CONTROL env var (default: 0, guarded live adapter control for phase 1 only)
+#   Set OPENVLA_ADAPTER_CONTROL_PHASES env var (optional; only phase 1 is accepted)
+#   Set OPENVLA_ADAPTER_CONTROL_FALLBACK env var (default: scripted; scripted or abort)
 #
 #   .\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares
 
@@ -130,6 +133,26 @@ parser.add_argument(
     default=None,
     help="Optional comma-separated phase allowlist for adapter dry-run readiness/candidate logging",
 )
+parser.add_argument(
+    "--phase1-adapter-control",
+    type=int,
+    choices=[0, 1],
+    default=None,
+    help="Guarded live adapter control for phase 1 only; default off",
+)
+parser.add_argument(
+    "--adapter-control-phases",
+    type=str,
+    default=None,
+    help="Optional live adapter control phase allowlist; only phase 1 is accepted",
+)
+parser.add_argument(
+    "--adapter-control-fallback",
+    type=str,
+    choices=["scripted", "abort"],
+    default=None,
+    help="When phase 1 live adapter control cannot apply, run scripted fallback or abort",
+)
 args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
@@ -206,6 +229,9 @@ CSV_FIELDS = [
     "adapter_delta_x", "adapter_delta_y", "adapter_delta_z",
     "adapter_delta_norm",
     "adapter_error_to_scripted",
+    "adapter_control_enabled",
+    "adapter_control_applied",
+    "adapter_control_fallback",
     "image_path",
 ]
 
@@ -352,6 +378,42 @@ def configured_adapter_enabled_phases() -> set[int] | None:
     return parse_adapter_enabled_phases(raw)
 
 
+def parse_adapter_control_phases(raw: str | None) -> set[int]:
+    phases = parse_adapter_enabled_phases(raw)
+    if phases is None:
+        return set()
+    disallowed = phases - {1}
+    if disallowed:
+        if 4 in disallowed:
+            raise ValueError("Live adapter control for phase 4 is not supported; only phase 1 can be enabled")
+        raise ValueError("Live adapter control is phase 1-only; use only phase 1")
+    return phases
+
+
+def configured_adapter_control_phases() -> set[int]:
+    raw = (
+        args.adapter_control_phases
+        if args.adapter_control_phases is not None
+        else os.environ.get("OPENVLA_ADAPTER_CONTROL_PHASES")
+    )
+    phases = parse_adapter_control_phases(raw)
+    phase1_enabled = configured_flag(args.phase1_adapter_control, "OPENVLA_PHASE1_ADAPTER_CONTROL", False)
+    if phase1_enabled:
+        phases.add(1)
+    return phases
+
+
+def configured_adapter_control_fallback() -> str:
+    fallback = (
+        args.adapter_control_fallback
+        if args.adapter_control_fallback is not None
+        else os.environ.get("OPENVLA_ADAPTER_CONTROL_FALLBACK", "scripted")
+    )
+    if fallback not in {"scripted", "abort"}:
+        raise ValueError("OPENVLA_ADAPTER_CONTROL_FALLBACK must be either 'scripted' or 'abort'")
+    return fallback
+
+
 def configured_vla_enabled_phases() -> set[int] | None:
     raw = (
         args.openvla_enabled_phases
@@ -479,6 +541,15 @@ def compute_adapter_delta(phase_config: dict[str, object], vla_action: np.ndarra
             sum(float(axis_coefficients.get(name, 0.0)) * value for name, value in features.items())
         )
     return np.array(delta, dtype=np.float32)
+
+
+def apply_phase1_adapter_control(pick_place: FrankaPickPlace, adapter_goal: np.ndarray, ik_method: str) -> None:
+    goal_orientation = pick_place.robot.get_downward_orientation()
+    pick_place.robot.set_end_effector_pose(position=adapter_goal, orientation=goal_orientation, ik_method=ik_method)
+    pick_place._step += 1
+    if pick_place._step >= pick_place.events_dt[1]:
+        pick_place._event += 1
+        pick_place._step = 0
 
 
 def sample_target_label(rng: np.random.Generator, labels: tuple[str, ...]) -> str:
@@ -652,6 +723,9 @@ def main():
     adapter_dry_run = configured_flag(args.adapter_dry_run, "OPENVLA_ADAPTER_DRY_RUN", adapter_config is not None)
     adapter_max_delta = configured_adapter_max_delta()
     adapter_enabled_phases = configured_adapter_enabled_phases()
+    adapter_control_phases = configured_adapter_control_phases()
+    adapter_control_enabled = 1 in adapter_control_phases
+    adapter_control_fallback = configured_adapter_control_fallback()
     cube_x_range = configured_range(args.cube_x_range, "OPENVLA_CUBE_X_RANGE", DEFAULT_CUBE_X_RANGE)
     cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
@@ -669,6 +743,19 @@ def main():
     )
     if min_distance < 0:
         raise ValueError("Minimum cube-target distance must be non-negative")
+    if adapter_control_enabled:
+        if adapter_config is None:
+            raise ValueError("Phase 1 adapter control requires --adapter-config/OPENVLA_ADAPTER_CONFIG")
+        if adapter_dry_run:
+            raise ValueError("Phase 1 adapter control requires --adapter-dry-run 0/OPENVLA_ADAPTER_DRY_RUN=0")
+        if vla_dry_run:
+            raise ValueError("Phase 1 adapter control requires --openvla-dry-run 0/OPENVLA_DRY_RUN=0")
+        if not vla_enabled:
+            raise ValueError("Phase 1 adapter control requires OpenVLA queries to be enabled")
+        if adapter_enabled_phases is not None and 1 not in adapter_enabled_phases:
+            raise ValueError("Phase 1 adapter control requires adapter phase allowlist to include phase 1")
+        if vla_enabled_phases is not None and 1 not in vla_enabled_phases:
+            raise ValueError("Phase 1 adapter control requires VLA phase allowlist to include phase 1")
 
     estimated_vla_samples = estimate_vla_samples_for_phases(total_runs, vla_enabled_phases)
     estimated_http_calls = 0 if (not vla_enabled or vla_dry_run) else estimated_vla_samples
@@ -709,6 +796,9 @@ def main():
             else ", ".join(str(phase) for phase in sorted(adapter_enabled_phases))
         )
     )
+    print(f"  Adapter control: {int(adapter_control_enabled)}")
+    print(f"  Adapter control phases: {'1' if adapter_control_enabled else 'none'}")
+    print(f"  Adapter control fallback: {adapter_control_fallback}")
     print(f"  Log dir:     {LOG_DIR}")
     print(f"  Random seed: {seed if seed is not None else 'system entropy'}")
     print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
@@ -828,6 +918,10 @@ def main():
         adapter_delta = None
         adapter_delta_norm = ""
         adapter_error_to_scripted = ""
+        adapter_control_this_step = bool(adapter_control_enabled and phase == 1)
+        adapter_control_applied = 0
+        adapter_control_fallback_used = ""
+        abort_after_log = False
 
         if should_sample_vla:
             sampled_vla_frames += 1
@@ -869,7 +963,7 @@ def main():
                 vla_error = str(e)
                 vla_errors += 1
 
-        if adapter_dry_run and adapter_config is not None and vla_action is not None:
+        if (adapter_dry_run or adapter_control_this_step) and adapter_config is not None and vla_action is not None:
             phase_config = adapter_phase_config(adapter_config, phase)
             if phase_config is not None:
                 phase_enabled = adapter_enabled_phases is None or phase in adapter_enabled_phases
@@ -889,12 +983,28 @@ def main():
                         adapter_rejected_reason = (
                             f"delta_norm {adapter_delta_norm:.4f} > max {adapter_max_delta:.4f}"
                         )
+                    elif adapter_control_this_step:
+                        adapter_control_applied = 1
                     print(
-                        f"  [ph{phase} s{phase_step:3d}] adapter dry-run goal "
+                        f"  [ph{phase} s{phase_step:3d}] adapter "
+                        f"{'control' if adapter_control_this_step else 'dry-run'} goal "
                         f"{np.round(adapter_goal, 4)} "
                         f"(error to scripted {adapter_error_to_scripted:.4f} m, "
                         f"accepted={adapter_accepted})"
                     )
+
+        if adapter_control_this_step and not adapter_control_applied:
+            adapter_control_fallback_used = adapter_control_fallback
+            if adapter_rejected_reason == "":
+                if vla_action is None:
+                    adapter_rejected_reason = vla_error or "no VLA action available for phase 1 adapter control"
+                else:
+                    adapter_rejected_reason = "no adapter phase 1 candidate available"
+            print(
+                f"  [ph{phase} s{phase_step:3d}] adapter control fallback={adapter_control_fallback_used}: "
+                f"{adapter_rejected_reason[:80]}"
+            )
+            abort_after_log = adapter_control_fallback == "abort"
 
         # ── Log row ───────────────────────────────────────────────────────────
         row = {
@@ -937,13 +1047,21 @@ def main():
             "adapter_delta_z":    adapter_delta[2] if adapter_delta is not None else "",
             "adapter_delta_norm": adapter_delta_norm,
             "adapter_error_to_scripted": adapter_error_to_scripted,
+            "adapter_control_enabled": int(adapter_control_this_step),
+            "adapter_control_applied": adapter_control_applied,
+            "adapter_control_fallback": adapter_control_fallback_used,
             "image_path":        image_path,
         }
         writer.writerow(row)
         csv_file.flush()
 
-        # ── Execute scripted step ─────────────────────────────────────────────
-        pick_place.forward(args.ik_method)
+        # ── Execute one step ─────────────────────────────────────────────────
+        if abort_after_log:
+            raise RuntimeError(f"Phase 1 adapter control aborted: {adapter_rejected_reason}")
+        if adapter_control_applied and adapter_goal is not None:
+            apply_phase1_adapter_control(pick_place, adapter_goal, args.ik_method)
+        else:
+            pick_place.forward(args.ik_method)
         global_step += 1
 
         # ── Check completion ──────────────────────────────────────────────────
