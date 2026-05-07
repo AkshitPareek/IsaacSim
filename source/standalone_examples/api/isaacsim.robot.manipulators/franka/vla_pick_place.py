@@ -39,6 +39,14 @@
 #   Set OPENVLA_PHASE1_ADAPTER_CONTROL env var (default: 0, guarded live adapter control for phase 1 only)
 #   Set OPENVLA_ADAPTER_CONTROL_PHASES env var (optional; only phase 1 is accepted)
 #   Set OPENVLA_ADAPTER_CONTROL_FALLBACK env var (default: scripted; scripted or abort)
+#   Set OPENVLA_PHASE1_CONTROL_MAX_DELTA env var (default: 0.030 m; tighter live cap, must be <= adapter dry-run cap)
+#   Set OPENVLA_PHASE1_CONTROL_WORKSPACE_X env var (default: 0.20,0.80; live-control goal X bounds)
+#   Set OPENVLA_PHASE1_CONTROL_WORKSPACE_Y env var (default: -0.50,0.50; live-control goal Y bounds)
+#   Set OPENVLA_PHASE1_CONTROL_Z_RANGE env var (default: 0.05,0.40; live-control goal Z bounds)
+#   Set OPENVLA_PHASE1_CONTROL_MAX_APPLIES env var (default: 1; live applies allowed per launch)
+#   Set OPENVLA_PHASE1_CONTROL_VLA_MAX_AGE_MS env var (default: 500; reject stale VLA responses)
+#   Set OPENVLA_PHASE1_CONTROL_REQUIRE_OPERATOR_ARM env var (default: 1)
+#   Set OPENVLA_PHASE1_CONTROL_OPERATOR_ARM env var (default: 0; explicit operator arm flag)
 #
 #   .\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --device cuda --ik-method damped-least-squares
 
@@ -153,6 +161,59 @@ parser.add_argument(
     default=None,
     help="When phase 1 live adapter control cannot apply, run scripted fallback or abort",
 )
+parser.add_argument(
+    "--phase1-control-max-delta",
+    type=float,
+    default=None,
+    help="Stricter Cartesian delta cap (meters) applied only in phase 1 live control",
+)
+parser.add_argument(
+    "--phase1-control-workspace-x",
+    type=float,
+    nargs=2,
+    default=None,
+    help="Live-control goal X bounds (low high), meters",
+)
+parser.add_argument(
+    "--phase1-control-workspace-y",
+    type=float,
+    nargs=2,
+    default=None,
+    help="Live-control goal Y bounds (low high), meters",
+)
+parser.add_argument(
+    "--phase1-control-z-range",
+    type=float,
+    nargs=2,
+    default=None,
+    help="Live-control goal Z bounds (low high), meters; below low is grasp territory",
+)
+parser.add_argument(
+    "--phase1-control-max-applies",
+    type=int,
+    default=None,
+    help="Maximum number of live phase 1 control steps applied across the whole launch",
+)
+parser.add_argument(
+    "--phase1-control-vla-max-age-ms",
+    type=float,
+    default=None,
+    help="Reject phase 1 live control if the VLA response latency exceeds this (ms)",
+)
+parser.add_argument(
+    "--phase1-control-require-operator-arm",
+    type=int,
+    choices=[0, 1],
+    default=None,
+    help="Require an explicit operator arm flag before phase 1 live control can apply (default 1)",
+)
+parser.add_argument(
+    "--phase1-control-operator-arm",
+    type=int,
+    choices=[0, 1],
+    default=None,
+    help="Operator arm flag for phase 1 live control; must be 1 if require-operator-arm is 1",
+)
 args, _ = parser.parse_known_args()
 
 from isaacsim import SimulationApp
@@ -210,6 +271,14 @@ DEFAULT_INSTRUCTION_TEMPLATE = "pick up the blue cube and place it on the {targe
 DEFAULT_TARGET_LABEL_MODE = "random"
 DEFAULT_SCRIPTED_STEPS_PER_RUN = 280
 DEFAULT_CAMERA_RESOLUTION = (320, 320)
+
+DEFAULT_PHASE1_CONTROL_MAX_DELTA = 0.030
+DEFAULT_PHASE1_CONTROL_WORKSPACE_X = (0.20, 0.80)
+DEFAULT_PHASE1_CONTROL_WORKSPACE_Y = (-0.50, 0.50)
+DEFAULT_PHASE1_CONTROL_Z_RANGE = (0.05, 0.40)
+DEFAULT_PHASE1_CONTROL_MAX_APPLIES = 1
+DEFAULT_PHASE1_CONTROL_VLA_MAX_AGE_MS = 500.0
+DEFAULT_PHASE1_CONTROL_REQUIRE_OPERATOR_ARM = True
 
 CSV_FIELDS = [
     "run_id", "phase", "phase_step", "global_step",
@@ -412,6 +481,118 @@ def configured_adapter_control_fallback() -> str:
     if fallback not in {"scripted", "abort"}:
         raise ValueError("OPENVLA_ADAPTER_CONTROL_FALLBACK must be either 'scripted' or 'abort'")
     return fallback
+
+
+def configured_phase1_control_envelope(adapter_max_delta: float) -> dict:
+    max_delta = (
+        args.phase1_control_max_delta
+        if args.phase1_control_max_delta is not None
+        else env_float("OPENVLA_PHASE1_CONTROL_MAX_DELTA", DEFAULT_PHASE1_CONTROL_MAX_DELTA)
+    )
+    if max_delta <= 0:
+        raise ValueError("Phase 1 control max-delta must be positive")
+    if max_delta > adapter_max_delta:
+        raise ValueError(
+            "Phase 1 control max-delta must be <= adapter dry-run max-delta "
+            f"({max_delta} > {adapter_max_delta})"
+        )
+    workspace_x = configured_range(
+        args.phase1_control_workspace_x,
+        "OPENVLA_PHASE1_CONTROL_WORKSPACE_X",
+        DEFAULT_PHASE1_CONTROL_WORKSPACE_X,
+    )
+    workspace_y = configured_range(
+        args.phase1_control_workspace_y,
+        "OPENVLA_PHASE1_CONTROL_WORKSPACE_Y",
+        DEFAULT_PHASE1_CONTROL_WORKSPACE_Y,
+    )
+    z_range = configured_range(
+        args.phase1_control_z_range,
+        "OPENVLA_PHASE1_CONTROL_Z_RANGE",
+        DEFAULT_PHASE1_CONTROL_Z_RANGE,
+    )
+    max_applies = (
+        args.phase1_control_max_applies
+        if args.phase1_control_max_applies is not None
+        else int(env_float("OPENVLA_PHASE1_CONTROL_MAX_APPLIES", float(DEFAULT_PHASE1_CONTROL_MAX_APPLIES)))
+    )
+    if max_applies < 1:
+        raise ValueError("Phase 1 control max-applies must be >= 1")
+    vla_max_age_ms = (
+        args.phase1_control_vla_max_age_ms
+        if args.phase1_control_vla_max_age_ms is not None
+        else env_float("OPENVLA_PHASE1_CONTROL_VLA_MAX_AGE_MS", DEFAULT_PHASE1_CONTROL_VLA_MAX_AGE_MS)
+    )
+    if vla_max_age_ms <= 0:
+        raise ValueError("Phase 1 control VLA max-age must be positive")
+    require_arm = configured_flag(
+        args.phase1_control_require_operator_arm,
+        "OPENVLA_PHASE1_CONTROL_REQUIRE_OPERATOR_ARM",
+        DEFAULT_PHASE1_CONTROL_REQUIRE_OPERATOR_ARM,
+    )
+    operator_arm = configured_flag(
+        args.phase1_control_operator_arm,
+        "OPENVLA_PHASE1_CONTROL_OPERATOR_ARM",
+        False,
+    )
+    return {
+        "max_delta": float(max_delta),
+        "workspace_x": workspace_x,
+        "workspace_y": workspace_y,
+        "z_range": z_range,
+        "max_applies": int(max_applies),
+        "vla_max_age_ms": float(vla_max_age_ms),
+        "require_arm": bool(require_arm),
+        "operator_arm": bool(operator_arm),
+    }
+
+
+def check_phase1_control_envelope(
+    adapter_goal: np.ndarray | None,
+    adapter_delta: np.ndarray | None,
+    adapter_delta_norm,
+    vla_latency_ms,
+    phase: int,
+    envelope: dict,
+    applies_remaining: int,
+) -> str:
+    if phase != 1:
+        return f"phase {phase} not in phase 1 live-control allowlist"
+    if adapter_goal is None or adapter_delta is None:
+        return "adapter goal/delta not computed"
+    if not np.all(np.isfinite(adapter_goal)) or not np.all(np.isfinite(adapter_delta)):
+        return "adapter goal/delta contains NaN/Inf"
+    if applies_remaining <= 0:
+        return f"phase 1 live-control apply budget exhausted (max {envelope['max_applies']})"
+    if isinstance(adapter_delta_norm, str) or adapter_delta_norm is None:
+        return "adapter delta norm not computed"
+    if float(adapter_delta_norm) > envelope["max_delta"]:
+        return (
+            f"delta_norm {float(adapter_delta_norm):.4f} > phase 1 live cap "
+            f"{envelope['max_delta']:.4f}"
+        )
+    gx, gy, gz = float(adapter_goal[0]), float(adapter_goal[1]), float(adapter_goal[2])
+    wx_lo, wx_hi = envelope["workspace_x"]
+    wy_lo, wy_hi = envelope["workspace_y"]
+    z_lo, z_hi = envelope["z_range"]
+    if not (wx_lo <= gx <= wx_hi):
+        return f"goal X {gx:.4f} outside [{wx_lo:.3f}, {wx_hi:.3f}]"
+    if not (wy_lo <= gy <= wy_hi):
+        return f"goal Y {gy:.4f} outside [{wy_lo:.3f}, {wy_hi:.3f}]"
+    if not (z_lo <= gz <= z_hi):
+        return f"goal Z {gz:.4f} outside [{z_lo:.3f}, {z_hi:.3f}]"
+    try:
+        latency_value = float(vla_latency_ms) if vla_latency_ms not in (None, "") else None
+    except (TypeError, ValueError):
+        latency_value = None
+    if latency_value is None:
+        return "VLA latency missing; cannot validate query age"
+    if latency_value > envelope["vla_max_age_ms"]:
+        return (
+            f"VLA latency {latency_value:.0f} ms > phase 1 live max age "
+            f"{envelope['vla_max_age_ms']:.0f} ms"
+        )
+    return ""
 
 
 def configured_vla_enabled_phases() -> set[int] | None:
@@ -726,6 +907,12 @@ def main():
     adapter_control_phases = configured_adapter_control_phases()
     adapter_control_enabled = 1 in adapter_control_phases
     adapter_control_fallback = configured_adapter_control_fallback()
+    phase1_control_envelope = (
+        configured_phase1_control_envelope(adapter_max_delta) if adapter_control_enabled else None
+    )
+    phase1_control_applies_remaining = (
+        phase1_control_envelope["max_applies"] if phase1_control_envelope is not None else 0
+    )
     cube_x_range = configured_range(args.cube_x_range, "OPENVLA_CUBE_X_RANGE", DEFAULT_CUBE_X_RANGE)
     cube_y_range = configured_range(args.cube_y_range, "OPENVLA_CUBE_Y_RANGE", DEFAULT_CUBE_Y_RANGE)
     target_x_range = configured_range(args.target_x_range, "OPENVLA_TARGET_X_RANGE", DEFAULT_TARGET_X_RANGE)
@@ -756,6 +943,12 @@ def main():
             raise ValueError("Phase 1 adapter control requires adapter phase allowlist to include phase 1")
         if vla_enabled_phases is not None and 1 not in vla_enabled_phases:
             raise ValueError("Phase 1 adapter control requires VLA phase allowlist to include phase 1")
+        if phase1_control_envelope["require_arm"] and not phase1_control_envelope["operator_arm"]:
+            raise ValueError(
+                "Phase 1 adapter control requires --phase1-control-operator-arm 1 "
+                "(or OPENVLA_PHASE1_CONTROL_OPERATOR_ARM=1). "
+                "Set --phase1-control-require-operator-arm 0 to bypass for offline scaffold checks only."
+            )
 
     estimated_vla_samples = estimate_vla_samples_for_phases(total_runs, vla_enabled_phases)
     estimated_http_calls = 0 if (not vla_enabled or vla_dry_run) else estimated_vla_samples
@@ -799,6 +992,16 @@ def main():
     print(f"  Adapter control: {int(adapter_control_enabled)}")
     print(f"  Adapter control phases: {'1' if adapter_control_enabled else 'none'}")
     print(f"  Adapter control fallback: {adapter_control_fallback}")
+    if phase1_control_envelope is not None:
+        env = phase1_control_envelope
+        print(f"  Phase 1 live cap:    {env['max_delta']:g} m")
+        print(f"  Phase 1 workspace X: {env['workspace_x']}")
+        print(f"  Phase 1 workspace Y: {env['workspace_y']}")
+        print(f"  Phase 1 Z range:     {env['z_range']}")
+        print(f"  Phase 1 max applies: {env['max_applies']}")
+        print(f"  Phase 1 VLA max age: {env['vla_max_age_ms']:g} ms")
+        print(f"  Phase 1 require arm: {int(env['require_arm'])}")
+        print(f"  Phase 1 operator arm:{int(env['operator_arm'])}")
     print(f"  Log dir:     {LOG_DIR}")
     print(f"  Random seed: {seed if seed is not None else 'system entropy'}")
     print(f"  Cube x/y:    {cube_x_range} / {cube_y_range}")
@@ -984,7 +1187,20 @@ def main():
                             f"delta_norm {adapter_delta_norm:.4f} > max {adapter_max_delta:.4f}"
                         )
                     elif adapter_control_this_step:
-                        adapter_control_applied = 1
+                        envelope_violation = check_phase1_control_envelope(
+                            adapter_goal=adapter_goal,
+                            adapter_delta=adapter_delta,
+                            adapter_delta_norm=adapter_delta_norm,
+                            vla_latency_ms=vla_latency_ms,
+                            phase=phase,
+                            envelope=phase1_control_envelope,
+                            applies_remaining=phase1_control_applies_remaining,
+                        )
+                        if envelope_violation == "":
+                            adapter_control_applied = 1
+                            phase1_control_applies_remaining -= 1
+                        else:
+                            adapter_rejected_reason = envelope_violation
                     print(
                         f"  [ph{phase} s{phase_step:3d}] adapter "
                         f"{'control' if adapter_control_this_step else 'dry-run'} goal "

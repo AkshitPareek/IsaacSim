@@ -745,8 +745,9 @@ Numeric envelope, all stricter than the Round 10 dry-run maxima:
 
 Implementation notes:
 
-- The current scaffold already enforces the allowlist + dry-run-off + adapter-config-loaded preconditions at startup. The remaining envelope items (`max-delta 0.030`, workspace radius, Z range, step budget, query-age check, operator-arm flag) are unimplemented and must be added in a separate review-gated PR before any `live-once` run.
-- Workspace and altitude checks should be applied to the proposed adapter goal itself, not just the delta, to reject teleport-style proposals.
+- The scaffold now enforces all of the AC envelope items via `check_phase1_control_envelope` in `vla_pick_place.py`: stricter live `max-delta` (default `0.030 m`), XY workspace bounds, Z range, per-launch apply budget, VLA latency-based query-age check, finite-value check on goal/delta, and an operator-arm gate (`--phase1-control-operator-arm 1` required by default). All preconditions also remain in the startup block (allowlists, dry-run-off, adapter-config-loaded).
+- Workspace and altitude checks are applied to the proposed adapter goal itself, not just the delta, to reject teleport-style proposals.
+- A "shadow" mode (envelope-validated dry-run that intentionally never applies) is not a separate code path; today it is approximated by `--adapter-dry-run 1 --phase1-adapter-control 0`. A dedicated shadow flag that runs the envelope check and logs the would-be-applied/would-be-rejected outcome is left for a future iteration.
 
 ### AD — Abort, fallback, and rollback rules
 
@@ -915,31 +916,26 @@ python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze
 python source\standalone_examples\api\isaacsim.robot.manipulators\franka\analyze_vla_adapter_dryrun.py --csv vla_calib_logs_phase1_scaffold_full_dryrun\calibration.csv --phase 1 --required-phases 1 --min-adapter-samples-per-phase 60 --require-ready --min-accepted-rate 0.90 --min-vla-success-rate 0.98 --max-adapter-delta-p95 0.052 --max-adapter-delta-max 0.055 --max-adapter-error-p95 0.065 --max-adapter-error-max 0.07 --worst-rows 5
 ```
 
-Future live-control scaffold commands, proposed contract only:
+Live-control scaffold commands (envelope flags now implemented; live-once still requires lead approval before any run):
+
+The Phase 1 scaffold flags below correspond to the `vla_pick_place.py` CLI. Live-once is gated by the AB checklist passing and a fresh lead review; do not launch a live-once command before then. Shadow mode (envelope-validated dry-run with no robot authority) is not yet a separate code path — it can be approximated today by combining `--adapter-dry-run 1` with `--phase1-adapter-control 0` so the proposal is logged but never applied.
 
 ```powershell
-# Live-control scaffold fast validation must default to shadow mode first.
-cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
-$env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_smoke_shadow"
-$env:OPENVLA_QUERY_EVERY="20"
-.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 1 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 3 --seed 2061 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 1 --adapter-max-delta 0.05 --adapter-enabled-phases 1 --phase1-control-mode shadow --phase1-control-max-delta 0.03 --phase1-control-max-steps 1 --phase1-control-gripper-lock 1 --phase1-control-require-operator-arm 1
-```
-
-```powershell
-# First live-control scaffold smoke, only after full dry-run gates and lead review pass.
+# First live-once scaffold smoke, only after full dry-run gates AND lead review pass.
+# Operator must explicitly arm via --phase1-control-operator-arm 1 before this will start.
 cd C:\Users\Akshit\Projects\isaacsim\_build\windows-x86_64\release
 $env:OPENVLA_LOG_DIR="C:\Users\Akshit\Projects\isaacsim\vla_calib_logs_phase1_scaffold_smoke_live_once"
 $env:OPENVLA_QUERY_EVERY="20"
-.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 0 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 3 --seed 2062 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 0 --adapter-max-delta 0.03 --adapter-enabled-phases 1 --phase1-control-mode live-once --phase1-control-max-delta 0.03 --phase1-control-max-steps 1 --phase1-control-gripper-lock 1 --phase1-control-require-operator-arm 1 --phase1-control-abort-on-reject 1
+.\python.bat standalone_examples\api\isaacsim.robot.manipulators\franka\vla_pick_place.py --headless 0 --camera-resolution 160 160 --device cuda --ik-method damped-least-squares --runs 3 --seed 2062 --target-labels "red target,green target,blue target" --target-label-mode balanced --runs-per-label 1 --instruction-template "pick up the blue cube and place it on the {target_label}" --openvla-enabled-phases 1 --openvla-save-images 0 --adapter-dry-run 0 --adapter-max-delta 0.05 --adapter-enabled-phases 1 --phase1-adapter-control 1 --adapter-control-fallback scripted --phase1-control-max-delta 0.03 --phase1-control-workspace-x 0.20 0.80 --phase1-control-workspace-y -0.50 0.50 --phase1-control-z-range 0.05 0.40 --phase1-control-max-applies 1 --phase1-control-vla-max-age-ms 500 --phase1-control-require-operator-arm 1 --phase1-control-operator-arm 1
 ```
 
 Live-control scaffold review gates:
 
-- Do not run any `live-once` command until the full dry-run gate above passes on a fresh dataset and lead review explicitly approves the single experiment.
-- The future scaffold must reject startup unless `--openvla-enabled-phases 1`, `--adapter-enabled-phases 1`, `--phase1-control-max-steps 1`, `--phase1-control-gripper-lock 1`, and `--phase1-control-require-operator-arm 1` are present.
+- Do not run any live-once command until the full dry-run gate above passes on a fresh dataset and lead review explicitly approves the single experiment.
+- The scaffold rejects startup unless `--phase1-adapter-control 1`, `--adapter-dry-run 0`, `--openvla-dry-run 0`, OpenVLA is enabled, and Phase 1 is in both `--openvla-enabled-phases` and `--adapter-enabled-phases`. With `--phase1-control-require-operator-arm 1` (default), `--phase1-control-operator-arm 1` is also required.
 - Fast smoke is for plumbing only; medium is for regression confidence; full is the only dry-run gate acceptable before a live-control review packet.
 - For the first live smoke, use `--headless 0` so the operator can see and abort the run. Any timeout, malformed action, adapter rejection, phase mismatch, unexpected gripper command, final-distance miss, simulator instability, or analyzer failure blocks further live attempts.
-- After live smoke, run the same dataset and adapter analyzers where applicable, plus a manual review of scaffold-specific columns for `control_mode`, `control_applied`, `control_rejected_reason`, `operator_armed`, and `abort_reason`.
+- After live smoke, run the same dataset and adapter analyzers where applicable, plus a manual review of scaffold-specific columns: `adapter_control_enabled`, `adapter_control_applied`, `adapter_control_fallback`, and rejection reasons in `adapter_rejected_reason` (which now also reports envelope violations such as `goal Z 0.42 outside [0.05, 0.40]` or `delta_norm 0.040 > phase 1 live cap 0.030`).
 
 ## Verification Targets
 
